@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 线程撕裂者
 // @namespace    https://github.com/Roushelfy/Bilibili-thread-ripper
-// @version      0.9.4.2
+// @version      0.9.4.3
 // @description  保留哔哩哔哩原生播放器，通过多 CDN、多 Range 并发下载改善视频缓冲速度。
 // @author       MrTangLuyao
 // @license      MIT
@@ -2281,7 +2281,7 @@ const chrome = (() => {
       urlDeadlineSeconds,
       video,
       getDebug: () => ({
-        version: "0.9.4.2",
+        version: "0.9.4.3",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,
@@ -3537,7 +3537,7 @@ const chrome = (() => {
   let transferSequence = 1;
   const transfers = new Map();
   const stats = {
-    version: "0.9.4.2",
+    version: "0.9.4.3",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -4728,7 +4728,7 @@ const chrome = (() => {
           state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
         }, null, 1);
       },
-      version: "0.9.4.2"
+      version: "0.9.4.3"
     })
   });
   publish();
@@ -4972,7 +4972,7 @@ const chrome = (() => {
 
   // ---- stats for the extension badge and the settings panel ----
   const stats = {
-    version: "0.9.4.2",
+    version: "0.9.4.3",
     architecture: "live-segment-ripper",
     mode: "live",
     playerState: "waiting",
@@ -5033,7 +5033,7 @@ const chrome = (() => {
     try { origin = new URL(playlistUrl).hostname; } catch (_error) {}
     if (origin) pool.add(origin, true);
     for (const host of core.KNOWN_FMP4_HOSTS) if (host !== origin) pool.add(host, false);
-    context = { key, playlistUrl, pool, cache: new Map(), lastNum: 0, mapUrl: "", probing: false, speculativeMisses: 0 };
+    context = { key, playlistUrl, pool, cache: new Map(), lastNum: 0, mapUrl: "", probing: false, speculativeMisses: 0, prefetchQueue: [], inflightPrefetch: 0, urgentInflight: 0 };
     stats.playerState = "ready";
     notices?.log("已接管这个直播", "直播分片改为多节点竞速下载，并提前缓存即将播放的分片。", "success", "", "live", "takeover");
     schedulePublish();
@@ -5186,6 +5186,32 @@ const chrome = (() => {
     return item;
   }
 
+  // Prefetch runs through a small queue instead of all at once: the first playlist would
+  // otherwise burst eight segments that compete for bandwidth with the very segment the
+  // player is waiting for, which is exactly when its shallow buffer runs dry. While the
+  // player waits for a segment (urgent), the queue nearly stops.
+  function pumpPrefetch(ctx) {
+    while (ctx.inflightPrefetch < (ctx.urgentInflight > 0 ? 1 : 3) && ctx.prefetchQueue.length) {
+      const next = ctx.prefetchQueue.shift();
+      if (ctx.cache.has(next.url)) continue;
+      ctx.inflightPrefetch += 1;
+      const item = cacheSegment(ctx, next.url, next.options);
+      const done = (ok) => {
+        try { next.options.onSettled?.(ok); } catch (_error) {}
+        ctx.inflightPrefetch = Math.max(0, ctx.inflightPrefetch - 1);
+        pumpPrefetch(ctx);
+      };
+      item.promise.then(() => done(true), () => done(false));
+    }
+  }
+
+  function enqueuePrefetch(ctx, url, options = {}) {
+    if (ctx.cache.has(url) || ctx.prefetchQueue.some((entry) => entry.url === url)) return;
+    ctx.prefetchQueue.push({ url, options });
+    if (ctx.prefetchQueue.length > 16) ctx.prefetchQueue.shift();
+    pumpPrefetch(ctx);
+  }
+
   // What a new playlist drives: prefetch the announced-but-uncached tail, the init map,
   // and — once everything announced is in hand — one speculative future segment, whose
   // 404 only means the encoder has not produced it yet.
@@ -5197,16 +5223,18 @@ const chrome = (() => {
     ctx.lastNum = Math.max(ctx.lastNum, parsed.lastNum);
     if (parsed.mapUrl) {
       ctx.mapUrl = parsed.mapUrl;
+      // The init segment is tiny and everything needs it: fetched at once, outside the queue.
       if (!ctx.cache.has(parsed.mapUrl)) cacheSegment(ctx, parsed.mapUrl);
     }
     probeCandidates(ctx, parsed.segments[0].url);
     // The whole announced window, not just the newest pieces: the player usually plays a
     // few seconds behind the live edge, and a piece it is about to ask for must already
     // be in hand — a cache miss there costs a fresh download against its shallow buffer.
+    // Oldest first: that is the order the player will consume them in.
     let pending = 0;
     for (const segment of parsed.segments) {
       if (!ctx.cache.has(segment.url)) {
-        cacheSegment(ctx, segment.url);
+        enqueuePrefetch(ctx, segment.url);
         pending += 1;
       }
     }
@@ -5214,8 +5242,10 @@ const chrome = (() => {
       const last = parsed.segments.at(-1);
       const nextUrl = last.url.replace(`${last.num}.m4s`, `${last.num + 1}.m4s`);
       if (!ctx.cache.has(nextUrl)) {
-        const item = cacheSegment(ctx, nextUrl, { speculative: true });
-        item.promise.then(() => { ctx.speculativeMisses = 0; }, () => { ctx.speculativeMisses += 1; });
+        enqueuePrefetch(ctx, nextUrl, {
+          speculative: true,
+          onSettled: (ok) => { ctx.speculativeMisses = ok ? 0 : ctx.speculativeMisses + 1; }
+        });
       }
     }
     stats.bufferedAhead = parsed.segments.filter((segment) => ctx.cache.get(segment.url)).length;
@@ -5224,8 +5254,12 @@ const chrome = (() => {
 
   async function serveSegment(url) {
     const ctx = context;
-    const item = ctx?.cache.get(url) || (ctx && directoryOf(url) === ctx.key ? cacheSegment(ctx, url, { urgent: true }) : null);
+    const cached = ctx?.cache.get(url);
+    const item = cached || (ctx && directoryOf(url) === ctx.key ? cacheSegment(ctx, url, { urgent: true }) : null);
     if (!item) return nativeFetch(url, { credentials: "omit", cache: "no-store" });
+    // While the player waits here, the prefetch queue slows to a trickle so the waited-for
+    // segment gets the bandwidth.
+    if (!cached && ctx) ctx.urgentInflight += 1;
     try {
       const result = await item.promise;
       if (!item.hit) {
@@ -5243,6 +5277,11 @@ const chrome = (() => {
       notices?.log("直播分片下载失败", `${stats.lastError}\n这一片交回给 B 站原来的连接。`, "error", "seg-fallback", "live", "download");
       schedulePublish();
       return nativeFetch(url, { credentials: "omit", cache: "no-store" });
+    } finally {
+      if (!cached && ctx) {
+        ctx.urgentInflight = Math.max(0, ctx.urgentInflight - 1);
+        pumpPrefetch(ctx);
+      }
     }
   }
 
@@ -5333,7 +5372,7 @@ const chrome = (() => {
         hosts: context.pool.status()
       },
       getStats: () => ({ ...stats }),
-      version: "0.9.4.2"
+      version: "0.9.4.3"
     })
   });
   publish();
@@ -5650,7 +5689,7 @@ const chrome = (() => {
   "use strict";
 
   const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
-  const VERSION = "0.9.4.2";
+  const VERSION = "0.9.4.3";
   const notices = globalThis.__BTR_NOTIFICATION_VIEW__;
   const ERROR_NOTICE_ID = "__bilibili_thread_ripper_error_notice__";
   const ERROR_NOTICE_STYLE_ID = "__bilibili_thread_ripper_error_notice_style__";

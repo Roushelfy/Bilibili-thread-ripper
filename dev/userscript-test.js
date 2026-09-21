@@ -7,7 +7,7 @@ const { chromium } = require("playwright");
 const root = path.resolve(__dirname, "..");
 const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
 const script = fs.readFileSync(path.join(root, "user_scripts/bilibili-thread-ripper.user.js"), "utf8");
-const scriptUrl = "https://raw.githubusercontent.com/MrTangLuyao/Bilibili-thread-ripper/main/user_scripts/bilibili-thread-ripper.user.js";
+const scriptUrl = "https://raw.githubusercontent.com/Roushelfy/Bilibili-thread-ripper/main/user_scripts/bilibili-thread-ripper.user.js";
 const source = file => fs.readFileSync(path.join(root, file), "utf8").replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").trimEnd();
 
 function checkFile() {

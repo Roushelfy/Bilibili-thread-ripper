@@ -65,7 +65,7 @@
   let transferSequence = 1;
   const transfers = new Map();
   const stats = {
-    version: "0.9.4.4",
+    version: "0.9.4.5",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -809,6 +809,27 @@
     });
   }
 
+  // While BTR plays the video, Bilibili's core never receives its "new quality rendered"
+  // confirmation, and after about twenty seconds it shows 切换失败 and rolls the menu back,
+  // although the stream switched long ago. Once the takeover really plays the requested
+  // quality, the pending switch is resolved for it (its qnSwitchingInfo carries the
+  // resolver; verified against the live player, where resolve() settles the switch
+  // without disturbing getQuality()).
+  let resolvedSwitchToken = null;
+  function resolveNativeQualitySwitch() {
+    if (!player || player.nativeTransport || stats.playerState !== "ready") return;
+    try {
+      const pending = root.player?.__core?.()?.qnSwitchingInfo?.video;
+      if (!pending?.switching || typeof pending.resolve !== "function" || resolvedSwitchToken === pending) return;
+      const target = nativeQuality();
+      const playingId = Number(player.getDebug?.()?.qualityId) || 0;
+      if (target && playingId !== target) return;
+      resolvedSwitchToken = pending;
+      pending.resolve({ type: "qualityChangeRendered", mediaType: "video", oldQuality: pending.oQn, newQuality: target || playingId, isMediaSegment: true, requestType: "MediaSegment" });
+      notices?.log("清晰度切换完成", "新清晰度已经在播放，已通知 B 站播放器。", "success", "", playerRoute, "playback");
+    } catch (_error) {}
+  }
+
   // The codec picked in the player's 播放策略 menu. Bilibili stores it as
   // bilibili_player_codec_prefer_type: "1" HEVC, "2" AVC, "3" AV1, "0" for "默认".
   function nativeCodec() {
@@ -1232,6 +1253,7 @@
     else {
       syncNativeQuality();
       syncNativeCodec();
+      resolveNativeQualitySwitch();
       refreshExpiringPlayinfo();
     }
     updateNativeInfoPanel();
@@ -1256,7 +1278,7 @@
           state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
         }, null, 1);
       },
-      version: "0.9.4.4"
+      version: "0.9.4.5"
     })
   });
   publish();

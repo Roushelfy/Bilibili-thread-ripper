@@ -10,6 +10,9 @@
   const SETTINGS_ID = "__bilibili_thread_ripper_native_settings__";
   const SETTINGS_STYLE_ID = "__bilibili_thread_ripper_native_settings_style__";
   if (root[INSTALL_FLAG]) return;
+  // The live site has its own module (live-hook.js); the userscript build loads every
+  // file everywhere, so the video takeover keeps off that hostname.
+  if (/^live\.bilibili\.com$/i.test(root.location?.hostname || "")) return;
 
   const core = root.__BILI_RANGE_CORE__;
   const playerFactory = root.__BILI_NATIVE_MSE_PLAYER_FACTORY__;
@@ -62,7 +65,7 @@
   let transferSequence = 1;
   const transfers = new Map();
   const stats = {
-    version: "0.9.3.0",
+    version: "0.9.4.0",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -1253,7 +1256,7 @@
           state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
         }, null, 1);
       },
-      version: "0.9.3.0"
+      version: "0.9.4.0"
     })
   });
   publish();

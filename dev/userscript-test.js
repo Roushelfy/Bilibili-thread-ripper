@@ -17,7 +17,7 @@ function checkFile() {
   assert.deepEqual(values("version"), [manifest.version]);
   assert.deepEqual(values("updateURL"), [scriptUrl]);
   assert.deepEqual(values("downloadURL"), [scriptUrl]);
-  assert.deepEqual(values("match"), ["https://www.bilibili.com/*", "https://m.bilibili.com/*"]);
+  assert.deepEqual(values("match"), ["https://www.bilibili.com/*", "https://m.bilibili.com/*", "https://live.bilibili.com/*"]);
   assert.deepEqual(values("run-at"), ["document-start"]);
   assert.deepEqual(values("grant").sort(), ["GM_addElement", "GM_registerMenuCommand", "unsafeWindow"]);
   assert.match(header, /^\/\/ @noframes$/m);

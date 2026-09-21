@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 线程撕裂者
 // @namespace    https://github.com/MrTangLuyao/Bilibili-thread-ripper
-// @version      0.9.3.0
+// @version      0.9.4.0
 // @description  保留哔哩哔哩原生播放器，通过多 CDN、多 Range 并发下载改善视频缓冲速度。
 // @author       MrTangLuyao
 // @license      MIT
@@ -11,6 +11,7 @@
 // @downloadURL  https://raw.githubusercontent.com/MrTangLuyao/Bilibili-thread-ripper/main/user_scripts/bilibili-thread-ripper.user.js
 // @match        https://www.bilibili.com/*
 // @match        https://m.bilibili.com/*
+// @match        https://live.bilibili.com/*
 // @run-at       document-start
 // @grant        GM_registerMenuCommand
 // @grant        GM_addElement
@@ -210,6 +211,8 @@ const chrome = (() => {
     const requested = Math.trunc(Number(source.concurrency));
     return {
       enabled: source.enabled !== false,
+      // The live module on live.bilibili.com; the master switch above still rules.
+      liveEnabled: source.liveEnabled !== false,
       // "full" replaces Bilibili's playback core; "compat" leaves it in charge and only
       // downloads its media requests.
       takeover: source.takeover === "compat" ? "compat" : "full",
@@ -2278,7 +2281,7 @@ const chrome = (() => {
       urlDeadlineSeconds,
       video,
       getDebug: () => ({
-        version: "0.9.3.0",
+        version: "0.9.4.0",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,
@@ -3125,6 +3128,7 @@ const chrome = (() => {
       </section>
 
       <section class="notice-controls" aria-label="提示设置">
+        <div class="notice-row"><label for="live-enabled">直播加速</label><label class="switch"><input id="live-enabled" type="checkbox" aria-label="直播加速"><span></span></label></div>
         <div class="notice-row"><label for="error-notices">显示错误</label><label class="switch"><input id="error-notices" type="checkbox" aria-label="显示错误"><span></span></label></div>
         <div class="notice-row"><label for="debug-notices">Debug 模式</label><label class="switch"><input id="debug-notices" type="checkbox" aria-label="Debug 模式"><span></span></label></div>
         <fieldset id="debug-filters" class="debug-filters" hidden>
@@ -3273,6 +3277,7 @@ const chrome = (() => {
     const sliderFill = $("slider-fill");
     const errorNotices = $("error-notices");
     const debugNotices = $("debug-notices");
+    const liveEnabled = $("live-enabled");
     const debugFilters = $("debug-filters");
     const debugCategoryInputs = [...shadow.querySelectorAll("[data-debug-category]")];
     const customSection = $("custom-hosts");
@@ -3348,6 +3353,7 @@ const chrome = (() => {
       setMode(settings.mode);
       customHosts = settings.customHosts;
       renderHosts();
+      liveEnabled.checked = settings.liveEnabled !== false;
       errorNotices.checked = settings.errorNotices;
       debugNotices.checked = settings.debugNotices;
       debugFilters.hidden = !settings.debugNotices;
@@ -3356,6 +3362,7 @@ const chrome = (() => {
 
     const saveDebugCategories = () => save({ debugCategories: Object.fromEntries(debugCategoryInputs.map((input) => [input.dataset.debugCategory, input.checked])) });
     enabled.addEventListener("change", () => save({ enabled: enabled.checked }));
+    liveEnabled.addEventListener("change", () => save({ liveEnabled: liveEnabled.checked }));
     concurrency.addEventListener("input", () => {
       const threads = THREAD_OPTIONS[Number(concurrency.value)];
       setSlider(threads);
@@ -3475,6 +3482,9 @@ const chrome = (() => {
   const SETTINGS_ID = "__bilibili_thread_ripper_native_settings__";
   const SETTINGS_STYLE_ID = "__bilibili_thread_ripper_native_settings_style__";
   if (root[INSTALL_FLAG]) return;
+  // The live site has its own module (live-hook.js); the userscript build loads every
+  // file everywhere, so the video takeover keeps off that hostname.
+  if (/^live\.bilibili\.com$/i.test(root.location?.hostname || "")) return;
 
   const core = root.__BILI_RANGE_CORE__;
   const playerFactory = root.__BILI_NATIVE_MSE_PLAYER_FACTORY__;
@@ -3527,7 +3537,7 @@ const chrome = (() => {
   let transferSequence = 1;
   const transfers = new Map();
   const stats = {
-    version: "0.9.3.0",
+    version: "0.9.4.0",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -4718,7 +4728,608 @@ const chrome = (() => {
           state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
         }, null, 1);
       },
-      version: "0.9.3.0"
+      version: "0.9.4.0"
+    })
+  });
+  publish();
+})(globalThis);
+
+/* src/live-core.js */
+(function installLiveCore(root) {
+  "use strict";
+
+  // The parts of the live module that carry logic: playinfo parsing, playlist parsing,
+  // P2P/proxy URL handling and the host pool. No DOM and no timers, so dev tests can run
+  // all of it in Node.
+
+  // fMP4 HLS nodes that accept each other's signatures, verified by probing real streams
+  // (2026-09): a segment signed for one of them downloads from all of them with HTTP 206,
+  // while FLV-line (ov-gotcha07) and TS-line (gotcha105) nodes answer 403. The pool probes
+  // each candidate once per stream before trusting it.
+  const KNOWN_FMP4_HOSTS = Object.freeze([
+    "d1--cn-gotcha204.bilivideo.com",
+    "d1--cn-gotcha208.bilivideo.com",
+    "d1--ov-gotcha208.bilivideo.com",
+    "d1--ov-gotcha208b.bilivideo.com"
+  ]);
+
+  const LIVE_HOST_RE = /(?:^|\.)bilivideo\.(?:com|cn|net)$/i;
+  const P2P_HOST_RE = /(?:^|\.)(?:mcdn\.bilivideo\.(?:com|cn|net)|szbdyd\.com|nexusedgeio\.com|ahdohpiechei\.com)$/i;
+  // A stream URL wrapped in a commercial relay: https://xxx.smtcdns.net/d1--yy.bilivideo.com/...
+  const PROXY_WRAP_RE = /^(https?:)\/\/[\w.-]+\.smtcdns\.(?:net|com)\/([\w-]+\.bilivideo\.(?:com|cn|net))(\/.*)$/i;
+
+  function hostnameOf(value) {
+    try { return new URL(value).hostname.toLowerCase(); }
+    catch (_error) { return ""; }
+  }
+
+  function isLiveSegmentUrl(value) {
+    try {
+      const url = new URL(value);
+      return url.protocol === "https:" && LIVE_HOST_RE.test(url.hostname) && /\/live-bvc\//.test(url.pathname) && /\.m4s$/i.test(url.pathname);
+    } catch (_error) { return false; }
+  }
+
+  function isLivePlaylistUrl(value) {
+    try {
+      const url = new URL(value);
+      return url.protocol === "https:" && LIVE_HOST_RE.test(url.hostname) && /\.m3u8$/i.test(url.pathname);
+    } catch (_error) { return false; }
+  }
+
+  function isP2pUrl(value) {
+    const host = hostnameOf(value);
+    if (!host) return false;
+    return P2P_HOST_RE.test(host) || host.split(".")[0].includes("302");
+  }
+
+  // A smtcdns-wrapped URL unwraps to the official node it relays for; anything else
+  // returns "" and stays untouched.
+  function unwrapProxyUrl(value) {
+    const match = PROXY_WRAP_RE.exec(String(value || ""));
+    return match ? `${match[1]}//${match[2]}${match[3]}` : "";
+  }
+
+  // The playurl of getRoomPlayInfo, flattened to one entry per protocol/format/codec.
+  function parseRoomPlayInfo(payload) {
+    const playurl = payload?.data?.playurl_info?.playurl
+      || payload?.result?.playurl_info?.playurl
+      || payload?.playurl_info?.playurl;
+    const out = [];
+    for (const stream of playurl?.stream || []) {
+      for (const format of stream.format || []) {
+        for (const codec of format.codec || []) {
+          const urls = (codec.url_info || [])
+            .map((info) => ({ host: String(info?.host || ""), extra: String(info?.extra || "") }))
+            .filter((info) => info.host && !isP2pUrl(info.host));
+          if (!urls.length || !codec.base_url) continue;
+          out.push({
+            protocol: String(stream.protocol_name || ""),
+            format: String(format.format_name || ""),
+            codec: String(codec.codec_name || ""),
+            qn: Number(codec.current_qn) || 0,
+            acceptQn: Array.isArray(codec.accept_qn) ? codec.accept_qn.map(Number) : [],
+            baseUrl: String(codec.base_url),
+            urls
+          });
+        }
+      }
+    }
+    return out;
+  }
+
+  function segmentNumber(name) {
+    const match = /(\d+)\.m4s$/i.exec(String(name || ""));
+    return match ? Number(match[1]) : 0;
+  }
+
+  // A live media playlist. Segment URLs resolve against the playlist URL, so a playlist
+  // fetched from any node names segments on that same node.
+  function parseM3u8(text, playlistUrl) {
+    const lines = String(text || "").split(/\r?\n/);
+    const segments = [];
+    let mapUrl = "";
+    let duration = 0;
+    for (const line of lines) {
+      if (line.startsWith("#EXT-X-MAP")) {
+        const uri = /URI="([^"]+)"/.exec(line)?.[1];
+        if (uri) try { mapUrl = new URL(uri, playlistUrl).href; } catch (_error) {}
+        continue;
+      }
+      if (line.startsWith("#EXTINF")) {
+        duration = Number(/#EXTINF:([\d.]+)/.exec(line)?.[1]) || 0;
+        continue;
+      }
+      if (!line || line.startsWith("#")) continue;
+      try {
+        segments.push({ name: line.trim(), url: new URL(line.trim(), playlistUrl).href, num: segmentNumber(line), duration });
+      } catch (_error) {}
+      duration = 0;
+    }
+    return { mapUrl, segments, lastNum: segments.at(-1)?.num || 0 };
+  }
+
+  // Node health for one live stream. Live pieces are one second long, so the pool acts
+  // fast: it ranks by first-byte time, blocks a failing node briefly, and bans one that
+  // twice sent nothing. An unproven candidate must pass a probe before it enters ranking.
+  function createHostPool(options = {}) {
+    const health = new Map(); // host -> {fbMs, bps, failures, blockedUntil, lastSuccessAt, proven}
+    const now = () => (options.now ? options.now() : Date.now());
+
+    function entry(host) {
+      if (!health.has(host)) health.set(host, { fbMs: 0, bps: 0, failures: 0, blockedUntil: 0, lastSuccessAt: 0, proven: false, emptyReplies: 0, banned: false });
+      return health.get(host);
+    }
+
+    return Object.freeze({
+      add(host, proven = false) {
+        const item = entry(String(host || "").toLowerCase());
+        if (proven) item.proven = true;
+      },
+      success(host, fbMs, bps) {
+        const item = entry(host);
+        item.proven = true;
+        item.banned = false;
+        item.emptyReplies = 0;
+        item.failures = 0;
+        item.blockedUntil = 0;
+        item.lastSuccessAt = now();
+        if (Number(fbMs) > 0) item.fbMs = item.fbMs ? item.fbMs * 0.6 + fbMs * 0.4 : fbMs;
+        if (Number(bps) > 0) item.bps = item.bps ? item.bps * 0.6 + bps * 0.4 : bps;
+      },
+      failure(host, receivedBytes = 0) {
+        const item = entry(host);
+        item.failures += 1;
+        item.blockedUntil = now() + Math.min(20000, 1500 * (2 ** Math.min(item.failures, 3)));
+        if (Number(receivedBytes) <= 0) {
+          item.emptyReplies += 1;
+          if (item.emptyReplies >= 2 && !item.banned) {
+            item.banned = true;
+            try { options.onBan?.(host); } catch (_error) {}
+          }
+        }
+      },
+      // Ranked hosts: proven ones by first-byte speed, then unproven candidates. Blocked
+      // and banned hosts drop out unless nothing else is left.
+      pick(count = 3) {
+        const time = now();
+        const all = [...health.entries()];
+        const open = all.filter(([, item]) => !item.banned && item.blockedUntil <= time);
+        const pool = (open.length ? open : all.filter(([, item]) => !item.banned)).length
+          ? (open.length ? open : all.filter(([, item]) => !item.banned))
+          : all;
+        const ranked = pool.sort(([, a], [, b]) =>
+          Number(b.proven) - Number(a.proven)
+          || (a.fbMs || 9e9) - (b.fbMs || 9e9)
+          || (b.bps || 0) - (a.bps || 0));
+        return ranked.slice(0, Math.max(1, count)).map(([host]) => host);
+      },
+      unproven() {
+        return [...health.entries()].filter(([, item]) => !item.proven && !item.banned).map(([host]) => host);
+      },
+      status() {
+        const time = now();
+        return [...health.entries()].map(([host, item]) => ({
+          host,
+          state: item.banned ? "banned" : item.blockedUntil > time ? "blocked" : item.proven ? "healthy" : "untested",
+          bps: Math.round(item.bps || 0)
+        }));
+      }
+    });
+  }
+
+  root.__BILI_LIVE_CORE__ = Object.freeze({
+    KNOWN_FMP4_HOSTS,
+    createHostPool,
+    isLivePlaylistUrl,
+    isLiveSegmentUrl,
+    isP2pUrl,
+    parseM3u8,
+    parseRoomPlayInfo,
+    segmentNumber,
+    unwrapProxyUrl
+  });
+})(globalThis);
+
+/* src/live-hook.js */
+(function installLiveHook(root) {
+  "use strict";
+
+  // The live module: only the live site, and the userscript build loads every file on
+  // every bilibili page, so the hostname decides. The dev fixtures run on 127.0.0.1 and
+  // opt in explicitly.
+  if (!/^live\.bilibili\.com$/i.test(root.location?.hostname || "") && root.__BTR_TEST_ALLOW_LIVE__ !== true) return;
+
+  const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
+  const INSTALL_FLAG = "__biliThreadRipperLiveInstalled";
+  const core = root.__BILI_LIVE_CORE__;
+  const rangeCore = root.__BILI_RANGE_CORE__;
+  const notices = root.__BTR_RUNTIME_NOTICES__;
+  if (!core || !rangeCore || typeof root.fetch !== "function" || root[INSTALL_FLAG]) return;
+  Object.defineProperty(root, INSTALL_FLAG, { value: true });
+
+  const nativeFetch = root.fetch.bind(root);
+  const HEDGE_MS = 400;
+  const FIRST_BYTE_TIMEOUT_MS = 2500;
+  const SEGMENT_TIMEOUT_MS = 8000;
+  const PREFETCH_WIDTH = 4;
+  const CACHE_LIMIT = 24;
+  const CACHE_TTL_MS = 45000;
+
+  let settings = rangeCore.normalizeSettings({});
+  let settingsLoaded = false;
+  const liveOn = () => settings.enabled && settings.liveEnabled !== false;
+
+  // Bilibili's web player loads P2P SDKs that pull pieces from other viewers over WebRTC.
+  // Overseas there are few viewers nearby, so P2P only adds stalls; the mocks keep the
+  // player on the HTTP path. (Approach proven by Make-Bilibili-Great-Than-Ever-Before.)
+  class MockPcdn { on() {} off() {} emit() {} destroy() {} }
+  for (const name of ["PCDNLoader", "BPP2PSDK", "SeederSDK"]) {
+    try { Object.defineProperty(root, name, { value: MockPcdn, writable: false }); } catch (_error) {}
+  }
+
+  // ---- stats for the extension badge and the settings panel ----
+  const stats = {
+    version: "0.9.4.0",
+    architecture: "live-segment-ripper",
+    mode: "live",
+    playerState: "waiting",
+    quality: "直播",
+    bufferedAhead: 0,
+    acceleratedRequests: 0,
+    acceleratedBytes: 0,
+    parallelSubrequests: 0,
+    activeThreads: 0,
+    totalSpeedBps: 0,
+    threadSpeeds: [],
+    discoveredCdns: 0,
+    healthyCdns: 0,
+    blockedCdns: 0,
+    cdnHosts: [],
+    lastHost: "",
+    lastError: "",
+    takeoverError: null
+  };
+  const activeTransfers = new Map();
+  let transferSequence = 1;
+  let publishTimer = null;
+  function publish() {
+    clearTimeout(publishTimer);
+    publishTimer = null;
+    const now = Date.now();
+    stats.activeThreads = activeTransfers.size;
+    stats.totalSpeedBps = Math.round([...activeTransfers.values()].reduce((sum, item) => now - item.at < 2000 ? sum + item.bps : sum, 0));
+    if (context) {
+      stats.cdnHosts = context.pool.status();
+      stats.discoveredCdns = stats.cdnHosts.length;
+      stats.healthyCdns = stats.cdnHosts.filter((item) => item.state === "healthy").length;
+      stats.blockedCdns = stats.cdnHosts.filter((item) => ["blocked", "banned"].includes(item.state)).length;
+    }
+    root.postMessage({ channel: CHANNEL, type: "stats", payload: { ...stats } }, "*");
+  }
+  function schedulePublish() {
+    if (!publishTimer) publishTimer = setTimeout(publish, 250);
+  }
+
+  // ---- one live stream: the playlist currently being played ----
+  // context: { key, playlistUrl, pool, cache: Map(url -> {promise, at, hit}), lastNum, mapUrl, probing }
+  let context = null;
+
+  const swapHost = (url, host) => { const u = new URL(url); u.hostname = host; u.port = ""; return u.href; };
+  const directoryOf = (url) => { try { const u = new URL(url); return u.pathname.slice(0, u.pathname.lastIndexOf("/") + 1); } catch (_error) { return ""; } };
+
+  function contextFor(playlistUrl) {
+    const key = directoryOf(playlistUrl);
+    if (context?.key === key) {
+      context.playlistUrl = playlistUrl;
+      return context;
+    }
+    const pool = core.createHostPool({
+      onBan(host) { notices?.log("已停用一个直播节点", `${host} 两次没有返回数据，这个直播接下来不再使用它。`, "error", "", "live", "download"); }
+    });
+    let origin = "";
+    try { origin = new URL(playlistUrl).hostname; } catch (_error) {}
+    if (origin) pool.add(origin, true);
+    for (const host of core.KNOWN_FMP4_HOSTS) if (host !== origin) pool.add(host, false);
+    context = { key, playlistUrl, pool, cache: new Map(), lastNum: 0, mapUrl: "", probing: false, speculativeMisses: 0 };
+    stats.playerState = "ready";
+    notices?.log("已接管这个直播", "直播分片改为多节点竞速下载，并提前缓存即将播放的分片。", "success", "", "live", "takeover");
+    schedulePublish();
+    return context;
+  }
+
+  // Candidate nodes must prove they serve this stream before ranking uses them: the
+  // signature is shared within the fMP4 node group, but a node may still lack the stream.
+  function probeCandidates(ctx, sampleUrl) {
+    if (ctx.probing) return;
+    const unproven = ctx.pool.unproven();
+    if (!unproven.length) return;
+    ctx.probing = true;
+    Promise.allSettled(unproven.map(async (host) => {
+      const startedAt = performance.now();
+      try {
+        const response = await nativeFetch(swapHost(sampleUrl, host), {
+          headers: { Range: "bytes=0-2047" },
+          credentials: "omit",
+          cache: "no-store",
+          signal: AbortSignal.timeout(4000)
+        });
+        const body = new Uint8Array(await response.arrayBuffer());
+        if ((response.status === 206 || response.status === 200) && body.byteLength > 0) {
+          ctx.pool.success(host, performance.now() - startedAt, 0);
+        } else {
+          ctx.pool.failure(host, body.byteLength);
+        }
+      } catch (_error) {
+        ctx.pool.failure(host, 0);
+      }
+    })).then(() => {
+      ctx.probing = false;
+      schedulePublish();
+    });
+  }
+
+  async function attemptSegment(ctx, url, host, signal) {
+    const startedAt = performance.now();
+    const transferId = transferSequence++;
+    activeTransfers.set(transferId, { at: Date.now(), bps: 0 });
+    schedulePublish();
+    let received = 0;
+    try {
+      const response = await nativeFetch(swapHost(url, host), {
+        credentials: "omit",
+        cache: "no-store",
+        signal
+      });
+      if (response.status !== 200 && response.status !== 206) {
+        throw Object.assign(new Error(`直播分片响应异常：HTTP ${response.status}`), { status: response.status });
+      }
+      const reader = response.body?.getReader?.();
+      const chunks = [];
+      if (reader) {
+        const firstByteTimer = setTimeout(() => reader.cancel(new DOMException("直播分片首字节超时", "TimeoutError")).catch(() => {}), FIRST_BYTE_TIMEOUT_MS);
+        let firstByteMs = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!firstByteMs) {
+            firstByteMs = performance.now() - startedAt;
+            clearTimeout(firstByteTimer);
+          }
+          chunks.push(value);
+          received += value.byteLength;
+          const item = activeTransfers.get(transferId);
+          if (item) item.bps = received * 1000 / Math.max(1, performance.now() - startedAt);
+        }
+        clearTimeout(firstByteTimer);
+      } else {
+        const body = new Uint8Array(await response.arrayBuffer());
+        chunks.push(body);
+        received = body.byteLength;
+      }
+      if (signal?.aborted) throw new DOMException("已取消", "AbortError");
+      if (received <= 0) throw new Error("直播分片为空");
+      const bytes = new Uint8Array(received);
+      let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+      const elapsed = Math.max(1, performance.now() - startedAt);
+      ctx.pool.success(host, elapsed, received * 1000 / elapsed);
+      stats.lastHost = host;
+      return { bytes, contentType: response.headers.get("content-type") || "video/iso.segment", host };
+    } catch (error) {
+      if (error?.name !== "AbortError" && Number(error?.status) !== 404) ctx.pool.failure(host, received);
+      throw error;
+    } finally {
+      activeTransfers.delete(transferId);
+      schedulePublish();
+    }
+  }
+
+  // One segment: the best node first, a hedge copy on the second-best when the first is
+  // slow to produce bytes. 404 means "not born yet" for a speculative fetch and is not a
+  // node failure.
+  async function downloadSegment(ctx, url, { speculative = false } = {}) {
+    const hosts = ctx.pool.pick(2);
+    if (!hosts.length) throw new Error("没有可用直播节点");
+    const controllers = hosts.map(() => new AbortController());
+    const overall = setTimeout(() => controllers.forEach((c) => c.abort(new DOMException("直播分片总超时", "TimeoutError"))), SEGMENT_TIMEOUT_MS);
+    let primaryFailed = () => {};
+    const primaryFailure = new Promise((resolve) => { primaryFailed = resolve; });
+    try {
+      const attempts = hosts.map((host, index) => (async () => {
+        if (index) {
+          await new Promise((resolve) => {
+            const timer = setTimeout(resolve, speculative ? HEDGE_MS * 3 : HEDGE_MS);
+            primaryFailure.then(() => { clearTimeout(timer); resolve(); });
+          });
+          if (controllers[index].signal.aborted) throw new DOMException("已取消", "AbortError");
+        }
+        try {
+          return await attemptSegment(ctx, url, host, controllers[index].signal);
+        } catch (error) {
+          if (!index) primaryFailed();
+          throw error;
+        }
+      })());
+      const winner = await Promise.any(attempts);
+      controllers.forEach((controller) => { if (!controller.signal.aborted) controller.abort(new DOMException("并发副本已取消", "AbortError")); });
+      return winner;
+    } catch (aggregate) {
+      throw aggregate?.errors?.at?.(-1) || aggregate;
+    } finally {
+      clearTimeout(overall);
+    }
+  }
+
+  function pruneCache(ctx) {
+    const now = Date.now();
+    for (const [key, item] of ctx.cache) {
+      if (key === ctx.mapUrl) continue;
+      if (now - item.at > CACHE_TTL_MS) ctx.cache.delete(key);
+    }
+    while (ctx.cache.size > CACHE_LIMIT) {
+      const oldest = [...ctx.cache.keys()].find((key) => key !== ctx.mapUrl);
+      if (!oldest) break;
+      ctx.cache.delete(oldest);
+    }
+  }
+
+  function cacheSegment(ctx, url, options = {}) {
+    let item = ctx.cache.get(url);
+    if (item) return item;
+    item = { at: Date.now(), hit: false, promise: downloadSegment(ctx, url, options) };
+    item.promise.catch(() => { if (ctx.cache.get(url) === item) ctx.cache.delete(url); });
+    ctx.cache.set(url, item);
+    pruneCache(ctx);
+    return item;
+  }
+
+  // What a new playlist drives: prefetch the announced-but-uncached tail, the init map,
+  // and — once everything announced is in hand — one speculative future segment, whose
+  // 404 only means the encoder has not produced it yet.
+  function onPlaylist(playlistUrl, text) {
+    if (!liveOn()) return;
+    const ctx = contextFor(playlistUrl);
+    const parsed = core.parseM3u8(text, playlistUrl);
+    if (!parsed.segments.length) return;
+    ctx.lastNum = Math.max(ctx.lastNum, parsed.lastNum);
+    if (parsed.mapUrl) {
+      ctx.mapUrl = parsed.mapUrl;
+      if (!ctx.cache.has(parsed.mapUrl)) cacheSegment(ctx, parsed.mapUrl);
+    }
+    probeCandidates(ctx, parsed.segments[0].url);
+    const tail = parsed.segments.slice(-PREFETCH_WIDTH);
+    let pending = 0;
+    for (const segment of tail) {
+      if (!ctx.cache.has(segment.url)) {
+        cacheSegment(ctx, segment.url);
+        pending += 1;
+      }
+    }
+    if (!pending && parsed.lastNum > 0 && ctx.speculativeMisses < 6) {
+      const last = parsed.segments.at(-1);
+      const nextUrl = last.url.replace(`${last.num}.m4s`, `${last.num + 1}.m4s`);
+      if (!ctx.cache.has(nextUrl)) {
+        const item = cacheSegment(ctx, nextUrl, { speculative: true });
+        item.promise.then(() => { ctx.speculativeMisses = 0; }, () => { ctx.speculativeMisses += 1; });
+      }
+    }
+    stats.bufferedAhead = tail.filter((segment) => ctx.cache.get(segment.url)).length;
+    schedulePublish();
+  }
+
+  async function serveSegment(url) {
+    const ctx = context;
+    const item = ctx?.cache.get(url) || (ctx && directoryOf(url) === ctx.key ? cacheSegment(ctx, url) : null);
+    if (!item) return nativeFetch(url, { credentials: "omit", cache: "no-store" });
+    try {
+      const result = await item.promise;
+      if (!item.hit) {
+        item.hit = true;
+        stats.acceleratedRequests += 1;
+        stats.acceleratedBytes += result.bytes.byteLength;
+        schedulePublish();
+      }
+      return new Response(result.bytes.slice(), {
+        status: 200,
+        headers: { "Content-Type": result.contentType, "Content-Length": String(result.bytes.byteLength) }
+      });
+    } catch (error) {
+      stats.lastError = String(error?.message || error).slice(0, 160);
+      notices?.log("直播分片下载失败", `${stats.lastError}\n这一片交回给 B 站原来的连接。`, "error", "seg-fallback", "live", "download");
+      schedulePublish();
+      return nativeFetch(url, { credentials: "omit", cache: "no-store" });
+    }
+  }
+
+  // P2P and relay-wrapped URLs route back to the best official node; without a pool yet,
+  // an smtcdns wrapper at least unwraps to the node it fronts.
+  function rewriteUrl(url) {
+    const unwrapped = core.unwrapProxyUrl(url) || url;
+    if (!core.isP2pUrl(unwrapped)) return unwrapped;
+    if (context && (core.isLiveSegmentUrl(unwrapped) || /\.m4s(?:\?|$)/i.test(unwrapped))) {
+      const best = context.pool.pick(1)[0];
+      if (best) try { return swapHost(unwrapped, best); } catch (_error) {}
+    }
+    return unwrapped;
+  }
+
+  root.fetch = function (input, init) {
+    let url = "";
+    try { url = input instanceof Request ? input.url : String(input); } catch (_error) {}
+    if (!liveOn() || !url) return nativeFetch(input, init);
+    const method = String(init?.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
+    if (method !== "GET") return nativeFetch(input, init);
+    const rewritten = rewriteUrl(url);
+    if (core.isLivePlaylistUrl(rewritten)) {
+      const pending = nativeFetch(rewritten === url ? input : rewritten, init);
+      pending.then((response) => {
+        response.clone().text().then((text) => onPlaylist(response.url || rewritten, text)).catch(() => {});
+      }).catch(() => {});
+      return pending;
+    }
+    if (core.isLiveSegmentUrl(rewritten) && !(init?.headers && new Headers(init.headers).get("range"))) {
+      return serveSegment(rewritten);
+    }
+    if (rewritten !== url) return nativeFetch(rewritten, init);
+    return nativeFetch(input, init);
+  };
+
+  // A player that loads media over XMLHttpRequest gets the URL rewrite (P2P removal and
+  // best-node routing); synthesizing full XHR responses is not worth the risk here.
+  const xhrPrototype = root.XMLHttpRequest?.prototype;
+  if (xhrPrototype) {
+    const nativeOpen = xhrPrototype.open;
+    xhrPrototype.open = function (method, url, ...rest) {
+      let target = url;
+      try {
+        if (liveOn() && String(method).toUpperCase() === "GET") {
+          const value = String(url || "");
+          const rewritten = rewriteUrl(value);
+          if (rewritten !== value) target = rewritten;
+          else if (core.isLiveSegmentUrl(value) && context) {
+            const best = context.pool.pick(1)[0];
+            const origin = new URL(value).hostname;
+            if (best && best !== origin && context.pool.status().find((item) => item.host === origin)?.state === "banned") {
+              target = swapHost(value, best);
+            }
+          }
+        }
+      } catch (_error) { target = url; }
+      return nativeOpen.call(this, method, target, ...rest);
+    };
+  }
+
+  root.addEventListener("message", (event) => {
+    if (event.source !== root || event.data?.channel !== CHANNEL) return;
+    if (event.data.type === "settings") {
+      const previous = settings;
+      settings = rangeCore.normalizeSettings(event.data.payload);
+      notices?.configure(settings);
+      if (!settingsLoaded || previous.enabled !== settings.enabled || previous.liveEnabled !== settings.liveEnabled) {
+        settingsLoaded = true;
+        notices?.log("直播加速设置已生效", liveOn() ? "直播分片使用多节点竞速下载。" : "直播加速已关闭，使用 B 站原来的连接。", "success", "", "live", "settings");
+      }
+      if (!liveOn()) {
+        context = null;
+        stats.playerState = "disabled";
+      }
+      publish();
+    } else if (event.data.type === "get-stats") {
+      publish();
+    }
+  });
+
+  Object.defineProperty(root, "__biliThreadRipperLiveDebug", {
+    value: Object.freeze({
+      getContext: () => context && {
+        key: context.key,
+        lastNum: context.lastNum,
+        cached: context.cache.size,
+        hosts: context.pool.status()
+      },
+      getStats: () => ({ ...stats }),
+      version: "0.9.4.0"
     })
   });
   publish();
@@ -5035,7 +5646,7 @@ const chrome = (() => {
   "use strict";
 
   const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
-  const VERSION = "0.9.3.0";
+  const VERSION = "0.9.4.0";
   const notices = globalThis.__BTR_NOTIFICATION_VIEW__;
   const ERROR_NOTICE_ID = "__bilibili_thread_ripper_error_notice__";
   const ERROR_NOTICE_STYLE_ID = "__bilibili_thread_ripper_error_notice_style__";
@@ -5044,7 +5655,7 @@ const chrome = (() => {
   const ONBOARDING_STORAGE_KEY = "btrOnboardingRevision";
   const ONBOARDING_REVISION = "native-progressive-mse-v1";
   const THREAD_OPTIONS = Object.freeze([4, 8, 16, 32, 64, 128]);
-  const DEFAULTS = { enabled: true, concurrency: 8, takeover: "full", mode: "mainland", customHosts: [], debugNotices: false, errorNotices: false, debugCategories: {} };
+  const DEFAULTS = { enabled: true, liveEnabled: true, concurrency: 8, takeover: "full", mode: "mainland", customHosts: [], debugNotices: false, errorNotices: false, debugCategories: {} };
   // Settings of the old ArtPlayer version and of the removed compatibility modes.
   const RETIRED_KEYS = ["statusNotice", "compatibilityMode", "volume", "danmaku", "danmakuFontSize", "subtitleLanguage", "subtitleLastLanguage"];
   let latestSettings = { ...DEFAULTS };

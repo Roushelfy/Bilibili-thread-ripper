@@ -16,10 +16,12 @@
 
   const nativeFetch = root.fetch.bind(root);
   const HEDGE_MS = 400;
+  // A piece the player is actively waiting for hedges sooner: pieces are one second long
+  // and its own buffer is shallow.
+  const URGENT_HEDGE_MS = 150;
   const FIRST_BYTE_TIMEOUT_MS = 2500;
   const SEGMENT_TIMEOUT_MS = 8000;
-  const PREFETCH_WIDTH = 4;
-  const CACHE_LIMIT = 24;
+  const CACHE_LIMIT = 32;
   const CACHE_TTL_MS = 45000;
 
   let settings = rangeCore.normalizeSettings({});
@@ -36,7 +38,7 @@
 
   // ---- stats for the extension badge and the settings panel ----
   const stats = {
-    version: "0.9.4.1",
+    version: "0.9.4.2",
     architecture: "live-segment-ripper",
     mode: "live",
     playerState: "waiting",
@@ -194,7 +196,7 @@
   // One segment: the best node first, a hedge copy on the second-best when the first is
   // slow to produce bytes. 404 means "not born yet" for a speculative fetch and is not a
   // node failure.
-  async function downloadSegment(ctx, url, { speculative = false } = {}) {
+  async function downloadSegment(ctx, url, { speculative = false, urgent = false } = {}) {
     const hosts = ctx.pool.pick(2);
     if (!hosts.length) throw new Error("没有可用直播节点");
     const controllers = hosts.map(() => new AbortController());
@@ -205,7 +207,7 @@
       const attempts = hosts.map((host, index) => (async () => {
         if (index) {
           await new Promise((resolve) => {
-            const timer = setTimeout(resolve, speculative ? HEDGE_MS * 3 : HEDGE_MS);
+            const timer = setTimeout(resolve, speculative ? HEDGE_MS * 3 : urgent ? URGENT_HEDGE_MS : HEDGE_MS);
             primaryFailure.then(() => { clearTimeout(timer); resolve(); });
           });
           if (controllers[index].signal.aborted) throw new DOMException("已取消", "AbortError");
@@ -264,9 +266,11 @@
       if (!ctx.cache.has(parsed.mapUrl)) cacheSegment(ctx, parsed.mapUrl);
     }
     probeCandidates(ctx, parsed.segments[0].url);
-    const tail = parsed.segments.slice(-PREFETCH_WIDTH);
+    // The whole announced window, not just the newest pieces: the player usually plays a
+    // few seconds behind the live edge, and a piece it is about to ask for must already
+    // be in hand — a cache miss there costs a fresh download against its shallow buffer.
     let pending = 0;
-    for (const segment of tail) {
+    for (const segment of parsed.segments) {
       if (!ctx.cache.has(segment.url)) {
         cacheSegment(ctx, segment.url);
         pending += 1;
@@ -280,13 +284,13 @@
         item.promise.then(() => { ctx.speculativeMisses = 0; }, () => { ctx.speculativeMisses += 1; });
       }
     }
-    stats.bufferedAhead = tail.filter((segment) => ctx.cache.get(segment.url)).length;
+    stats.bufferedAhead = parsed.segments.filter((segment) => ctx.cache.get(segment.url)).length;
     schedulePublish();
   }
 
   async function serveSegment(url) {
     const ctx = context;
-    const item = ctx?.cache.get(url) || (ctx && directoryOf(url) === ctx.key ? cacheSegment(ctx, url) : null);
+    const item = ctx?.cache.get(url) || (ctx && directoryOf(url) === ctx.key ? cacheSegment(ctx, url, { urgent: true }) : null);
     if (!item) return nativeFetch(url, { credentials: "omit", cache: "no-store" });
     try {
       const result = await item.promise;
@@ -395,7 +399,7 @@
         hosts: context.pool.status()
       },
       getStats: () => ({ ...stats }),
-      version: "0.9.4.1"
+      version: "0.9.4.2"
     })
   });
   publish();

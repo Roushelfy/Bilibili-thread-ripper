@@ -19,7 +19,8 @@ const { chromium } = require("playwright");
     ["codec-choice-test.html", "codec-choice-result"],
     ["takeover-mode-test.html", "takeover-mode-result"],
     ["quota-refresh-test.html", "quota-refresh-result"],
-    ["live-hook-test.html", "live-hook-result"]
+    ["live-hook-test.html", "live-hook-result"],
+    ["buffered-shim-test.html", "buffered-shim-result"]
   ];
   try {
     for (let offset = 0; offset < tests.length; offset += 3) {

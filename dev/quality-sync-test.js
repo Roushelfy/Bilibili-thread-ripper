@@ -85,7 +85,7 @@
       && output.steps.changeWithoutClick
       && output.steps.backToAuto
       && output.steps.onePlayer
-      && root.__biliThreadRipperDebug?.version === "0.9.4.3";
+      && root.__biliThreadRipperDebug?.version === "0.9.4.4";
     render();
     result.dataset.pass = String(output.pass);
   })();

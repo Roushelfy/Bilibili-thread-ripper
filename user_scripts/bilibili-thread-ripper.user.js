@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 线程撕裂者
 // @namespace    https://github.com/Roushelfy/Bilibili-thread-ripper
-// @version      0.9.4.3
+// @version      0.9.4.4
 // @description  保留哔哩哔哩原生播放器，通过多 CDN、多 Range 并发下载改善视频缓冲速度。
 // @author       MrTangLuyao
 // @license      MIT
@@ -1475,8 +1475,12 @@ const chrome = (() => {
     const videos = Array.from(byQuality.values()).sort((a, b) =>
       (Number(b.height) || 0) - (Number(a.height) || 0) || frameRate(b) - frameRate(a) ||
       (Number(b.bandwidth) || 0) - (Number(a.bandwidth) || 0));
-    const audio = (dash.audio || []).filter((item) => supported(item, "audio"))
+    // Dolby and Hi-Res sources keep their tracks in dash.dolby.audio / dash.flac.audio;
+    // some of them have nothing in dash.audio at all, which used to fail the takeover.
+    // Ordinary tracks stay preferred, like the native player's default.
+    const audioOf = (list) => [].concat(list || []).filter((item) => supported(item, "audio"))
       .sort((a, b) => (Number(b.bandwidth) || 0) - (Number(a.bandwidth) || 0))[0];
+    const audio = audioOf(dash.audio) || audioOf(dash.flac?.audio) || audioOf(dash.dolby?.audio);
     if (!videos.length || !audio) throw new Error("浏览器不支持清单中的视频或音频编码");
     const requestedQuality = Number(body?.quality || body?.qn) || 0;
     const preferred = [Number(preferredQuality) || 0, requestedQuality]
@@ -1565,6 +1569,35 @@ const chrome = (() => {
     const segment = track?.sidx?.segments?.[track.startupIndex];
     if (segment?.durationSeconds > 0 && segment?.length > 0) return segment.length / segment.durationSeconds;
     return Math.max(0, Number(track?.representation?.bandwidth) || 0) / 8;
+  }
+
+  // While BTR plays the video, Bilibili's own core keeps timers that read its SourceBuffers,
+  // which detached from their MediaSource when the takeover replaced the element's source.
+  // HDR and 8K sources poll especially often, and every read throws InvalidStateError into
+  // the page's error reporting. While a takeover is active, such a read answers with an
+  // empty range instead; without one the browser behaves as before.
+  let bufferedShimInstalled = false;
+  function installBufferedShim() {
+    if (bufferedShimInstalled || !root.SourceBuffer) return;
+    const descriptor = Object.getOwnPropertyDescriptor(root.SourceBuffer.prototype, "buffered");
+    if (!descriptor?.get || !descriptor.configurable) return;
+    bufferedShimInstalled = true;
+    const emptyRanges = Object.freeze({
+      length: 0,
+      start() { throw new DOMException("空的缓冲区间", "IndexSizeError"); },
+      end() { throw new DOMException("空的缓冲区间", "IndexSizeError"); }
+    });
+    Object.defineProperty(root.SourceBuffer.prototype, "buffered", {
+      ...descriptor,
+      get() {
+        try {
+          return descriptor.get.call(this);
+        } catch (error) {
+          if (error?.name === "InvalidStateError" && document.querySelector('[data-btr-mse-active="true"]')) return emptyRanges;
+          throw error;
+        }
+      }
+    });
   }
 
   function createNativePlayer(options) {
@@ -2281,7 +2314,7 @@ const chrome = (() => {
       urlDeadlineSeconds,
       video,
       getDebug: () => ({
-        version: "0.9.4.3",
+        version: "0.9.4.4",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,
@@ -2315,6 +2348,7 @@ const chrome = (() => {
     });
   }
 
+  installBufferedShim();
   root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = Object.freeze({ createNativePlayer, qualityLabel, selectRepresentations });
 })(globalThis);
 
@@ -3537,7 +3571,7 @@ const chrome = (() => {
   let transferSequence = 1;
   const transfers = new Map();
   const stats = {
-    version: "0.9.4.3",
+    version: "0.9.4.4",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -4728,7 +4762,7 @@ const chrome = (() => {
           state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
         }, null, 1);
       },
-      version: "0.9.4.3"
+      version: "0.9.4.4"
     })
   });
   publish();
@@ -4972,7 +5006,7 @@ const chrome = (() => {
 
   // ---- stats for the extension badge and the settings panel ----
   const stats = {
-    version: "0.9.4.3",
+    version: "0.9.4.4",
     architecture: "live-segment-ripper",
     mode: "live",
     playerState: "waiting",
@@ -5372,7 +5406,7 @@ const chrome = (() => {
         hosts: context.pool.status()
       },
       getStats: () => ({ ...stats }),
-      version: "0.9.4.3"
+      version: "0.9.4.4"
     })
   });
   publish();
@@ -5689,7 +5723,7 @@ const chrome = (() => {
   "use strict";
 
   const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
-  const VERSION = "0.9.4.3";
+  const VERSION = "0.9.4.4";
   const notices = globalThis.__BTR_NOTIFICATION_VIEW__;
   const ERROR_NOTICE_ID = "__bilibili_thread_ripper_error_notice__";
   const ERROR_NOTICE_STYLE_ID = "__bilibili_thread_ripper_error_notice_style__";

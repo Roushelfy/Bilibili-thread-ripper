@@ -3,8 +3,10 @@ $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 $manifest = [System.IO.File]::ReadAllText((Join-Path $projectRoot "manifest.json"), $utf8) | ConvertFrom-Json
 $version = [string]$manifest.version
-$repository = "https://github.com/MrTangLuyao/Bilibili-thread-ripper"
-$scriptUrl = "https://raw.githubusercontent.com/MrTangLuyao/Bilibili-thread-ripper/main/user_scripts/bilibili-thread-ripper.user.js"
+# 自发布配置：这个分支的油猴脚本从 Roushelfy fork 的 live-ripper 分支分发和更新。
+# 提交给上游（MrTangLuyao）之前，把这两行改回上游仓库和 main 分支。
+$repository = "https://github.com/Roushelfy/Bilibili-thread-ripper"
+$scriptUrl = "https://raw.githubusercontent.com/Roushelfy/Bilibili-thread-ripper/live-ripper/user_scripts/bilibili-thread-ripper.user.js"
 
 function Read-Source([string]$file) {
   return ([System.IO.File]::ReadAllText((Join-Path $projectRoot $file), $utf8).TrimStart([char]0xFEFF) -replace "`r`n", "`n").TrimEnd([char]10)

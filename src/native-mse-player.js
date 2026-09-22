@@ -229,6 +229,30 @@
     });
   }
 
+  // Bilibili's core keeps its own element listeners while BTR plays, and they run against
+  // state it never finished initializing: its seek handler reads DVRWindow off a
+  // representation info it only fills once its own stream starts, and its buffer checks read
+  // 'updating' off a SourceBuffer that left its MediaSource. Both throw into the page on every
+  // drag, where its own error reporter picks them up. While a takeover is active these two are
+  // swallowed and counted for the diagnostic report; every other error, and every error while
+  // Bilibili itself plays, is left untouched.
+  const nativeLeftovers = { suppressed: 0, last: "" };
+  const NATIVE_LEFTOVER_RE = /DVRWindow|reading '?updating'?/;
+  let leftoverGuardInstalled = false;
+  function installNativeErrorGuard() {
+    if (leftoverGuardInstalled || typeof root.addEventListener !== "function") return;
+    leftoverGuardInstalled = true;
+    root.addEventListener("error", (event) => {
+      if (!NATIVE_LEFTOVER_RE.test(String(event.message || ""))) return;
+      if (!/hdslb\.com\/.*player/i.test(String(event.filename || ""))) return;
+      if (!document.querySelector('[data-btr-mse-active="true"]')) return;
+      nativeLeftovers.suppressed += 1;
+      nativeLeftovers.last = String(event.message || "").slice(0, 120);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, true);
+  }
+
   function createNativePlayer(options) {
     const getSettings = options.getSettings;
     const video = options.container.querySelector("video");
@@ -1092,7 +1116,7 @@
       urlDeadlineSeconds,
       video,
       getDebug: () => ({
-        version: "0.9.4.2",
+        version: "0.9.4.3",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,
@@ -1116,6 +1140,9 @@
         startupWaitingEvents: session?.startupWaitingEvents || 0,
         bufferAheadLimit: session?.bufferAheadLimit || 0,
         urlDeadline: urlDeadlineSeconds(),
+        // Errors from Bilibili's idle core that were kept out of the page's console.
+        nativeLeftoversSuppressed: nativeLeftovers.suppressed,
+        lastNativeLeftover: nativeLeftovers.last,
         progressiveAppends: session?.progressiveAppends || 0,
         seekReloads,
         lastSeekMs: Math.round(lastSeekMs),
@@ -1127,5 +1154,6 @@
   }
 
   installBufferedShim();
+  installNativeErrorGuard();
   root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = Object.freeze({ createNativePlayer, qualityLabel, selectRepresentations });
 })(globalThis);

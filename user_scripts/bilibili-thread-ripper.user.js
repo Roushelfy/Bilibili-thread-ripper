@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 线程撕裂者_测试
 // @namespace    https://github.com/Roushelfy/Bilibili-thread-ripper
-// @version      0.9.4.2
+// @version      0.9.4.3
 // @description  保留哔哩哔哩原生播放器，通过多 CDN、多 Range 并发下载改善视频缓冲速度。
 // @author       MrTangLuyao
 // @license      MIT
@@ -1721,6 +1721,30 @@ const chrome = (() => {
     });
   }
 
+  // Bilibili's core keeps its own element listeners while BTR plays, and they run against
+  // state it never finished initializing: its seek handler reads DVRWindow off a
+  // representation info it only fills once its own stream starts, and its buffer checks read
+  // 'updating' off a SourceBuffer that left its MediaSource. Both throw into the page on every
+  // drag, where its own error reporter picks them up. While a takeover is active these two are
+  // swallowed and counted for the diagnostic report; every other error, and every error while
+  // Bilibili itself plays, is left untouched.
+  const nativeLeftovers = { suppressed: 0, last: "" };
+  const NATIVE_LEFTOVER_RE = /DVRWindow|reading '?updating'?/;
+  let leftoverGuardInstalled = false;
+  function installNativeErrorGuard() {
+    if (leftoverGuardInstalled || typeof root.addEventListener !== "function") return;
+    leftoverGuardInstalled = true;
+    root.addEventListener("error", (event) => {
+      if (!NATIVE_LEFTOVER_RE.test(String(event.message || ""))) return;
+      if (!/hdslb\.com\/.*player/i.test(String(event.filename || ""))) return;
+      if (!document.querySelector('[data-btr-mse-active="true"]')) return;
+      nativeLeftovers.suppressed += 1;
+      nativeLeftovers.last = String(event.message || "").slice(0, 120);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, true);
+  }
+
   function createNativePlayer(options) {
     const getSettings = options.getSettings;
     const video = options.container.querySelector("video");
@@ -2584,7 +2608,7 @@ const chrome = (() => {
       urlDeadlineSeconds,
       video,
       getDebug: () => ({
-        version: "0.9.4.2",
+        version: "0.9.4.3",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,
@@ -2608,6 +2632,9 @@ const chrome = (() => {
         startupWaitingEvents: session?.startupWaitingEvents || 0,
         bufferAheadLimit: session?.bufferAheadLimit || 0,
         urlDeadline: urlDeadlineSeconds(),
+        // Errors from Bilibili's idle core that were kept out of the page's console.
+        nativeLeftoversSuppressed: nativeLeftovers.suppressed,
+        lastNativeLeftover: nativeLeftovers.last,
         progressiveAppends: session?.progressiveAppends || 0,
         seekReloads,
         lastSeekMs: Math.round(lastSeekMs),
@@ -2619,6 +2646,7 @@ const chrome = (() => {
   }
 
   installBufferedShim();
+  installNativeErrorGuard();
   root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = Object.freeze({ createNativePlayer, qualityLabel, selectRepresentations });
 })(globalThis);
 
@@ -3841,7 +3869,7 @@ const chrome = (() => {
   let transferSequence = 1;
   const transfers = new Map();
   const stats = {
-    version: "0.9.4.2",
+    version: "0.9.4.3",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -5176,7 +5204,7 @@ const chrome = (() => {
           state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
         }, null, 1);
       },
-      version: "0.9.4.2"
+      version: "0.9.4.3"
     })
   });
   publish();
@@ -5420,7 +5448,7 @@ const chrome = (() => {
 
   // ---- stats for the extension badge and the settings panel ----
   const stats = {
-    version: "0.9.4.2",
+    version: "0.9.4.3",
     architecture: "live-segment-ripper",
     mode: "live",
     playerState: "waiting",
@@ -5820,7 +5848,7 @@ const chrome = (() => {
         hosts: context.pool.status()
       },
       getStats: () => ({ ...stats }),
-      version: "0.9.4.2"
+      version: "0.9.4.3"
     })
   });
   publish();
@@ -6137,7 +6165,7 @@ const chrome = (() => {
   "use strict";
 
   const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
-  const VERSION = "0.9.4.2";
+  const VERSION = "0.9.4.3";
   const notices = globalThis.__BTR_NOTIFICATION_VIEW__;
   const ERROR_NOTICE_ID = "__bilibili_thread_ripper_error_notice__";
   const ERROR_NOTICE_STYLE_ID = "__bilibili_thread_ripper_error_notice_style__";

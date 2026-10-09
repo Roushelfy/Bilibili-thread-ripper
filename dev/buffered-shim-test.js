@@ -62,6 +62,12 @@
       const foreign = ourOwn();
       window.dispatchEvent(foreign);
       output.checks.otherSourceKept = !foreign.defaultPrevented;
+      const lookalike = new ErrorEvent("error", {
+        message: "Uncaught TypeError: Cannot read properties of undefined (reading 'DVRWindow')",
+        filename: "https://example.com/hdslb.com/player/core.js", cancelable: true
+      });
+      window.dispatchEvent(lookalike);
+      output.checks.lookalikeSourceKept = !lookalike.defaultPrevented;
       delete container.dataset.btrMseActive;
       const withoutTakeover = leftover();
       window.dispatchEvent(withoutTakeover);

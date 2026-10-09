@@ -1,33 +1,50 @@
 "use strict";
-// Needs dev/server.js. Checks the built user_scripts/bilibili-thread-ripper.user.js.
+// Needs dev/server.js. Builds the userscript from the current source files into
+// dist/userscript-test.user.js and runs that in dev/userscript-test.html; the published
+// user_scripts/bilibili-thread-ripper.user.js only changes when a version is released.
 const assert = require("node:assert/strict");
 const fs = require("node:fs"), path = require("node:path"), vm = require("node:vm");
+const { pathToFileURL } = require("node:url");
 const { chromium } = require("playwright");
 
 const root = path.resolve(__dirname, "..");
-const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
-const script = fs.readFileSync(path.join(root, "user_scripts/bilibili-thread-ripper.user.js"), "utf8");
+const meta = JSON.parse(fs.readFileSync(path.join(root, "user_scripts/adapter/meta.json"), "utf8"));
+// The published file carries the version of the newest release in CHANGELOG.md; the test
+// build uses the same one.
+const version = fs.readFileSync(path.join(root, "CHANGELOG.md"), "utf8").match(/^## \[(\d+\.\d+\.\d+\.\d+)\]/m)[1];
+const published = fs.readFileSync(path.join(root, "user_scripts/bilibili-thread-ripper.user.js"), "utf8");
+let script = "";
 const scriptUrl = "https://raw.githubusercontent.com/Roushelfy/Bilibili-thread-ripper/main/user_scripts/bilibili-thread-ripper.user.js";
-const source = file => fs.readFileSync(path.join(root, file), "utf8").replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").trimEnd();
+const source = file => fs.readFileSync(path.join(root, file), "utf8").replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").trimEnd().split("__BTR_VERSION__").join(version);
+
+function checkPublished() {
+  const header = published.slice(0, published.indexOf("// ==/UserScript=="));
+  const values = name => [...header.matchAll(new RegExp(`^// @${name}\\s+(.+)$`, "gm"))].map(match => match[1].trim());
+  assert.deepEqual(values("version"), [version], "the published script is not the newest release in CHANGELOG.md");
+  assert.deepEqual(values("updateURL"), [scriptUrl]);
+}
 
 function checkFile() {
   assert.ok(script.startsWith("// ==UserScript==\n"), "Tampermonkey needs the header on the first line");
   const header = script.slice(0, script.indexOf("// ==/UserScript=="));
   const values = name => [...header.matchAll(new RegExp(`^// @${name}\\s+(.+)$`, "gm"))].map(match => match[1].trim());
-  assert.deepEqual(values("version"), [manifest.version]);
+  assert.deepEqual(values("version"), [version]);
+  assert.equal(script.includes("__BTR_VERSION__"), false, "the version placeholder was left in the built file");
   assert.deepEqual(values("updateURL"), [scriptUrl]);
   assert.deepEqual(values("downloadURL"), [scriptUrl]);
-  assert.deepEqual(values("match"), ["https://www.bilibili.com/*", "https://m.bilibili.com/*", "https://live.bilibili.com/*"]);
+  // Every bilibili.com page: the settings panel opens everywhere, the video and live
+  // modules keep to their own hostnames in the page code.
+  assert.deepEqual(values("match"), ["https://*.bilibili.com/*"]);
   assert.deepEqual(values("run-at"), ["document-start"]);
-  assert.deepEqual(values("grant").sort(), ["GM_addElement", "GM_registerMenuCommand", "unsafeWindow"]);
+  assert.deepEqual(values("grant").sort(), ["GM.getValue", "GM.setValue", "GM_addElement", "GM_addValueChangeListener", "GM_registerMenuCommand", "unsafeWindow"]);
   // Live players sit in live.bilibili.com iframes, so the script must run in frames; the
   // page code itself keeps other sites' iframes out.
   assert.doesNotMatch(header, /^\/\/ @noframes$/m);
   assert.match(script, /window\.top !== window && !\/\^live/);
   new vm.Script(script, { filename: "bilibili-thread-ripper.user.js" });
-  // The extension's content scripts, settings panel included, are there unchanged and in
-  // order; a file both script lists use appears once.
-  const files = [...new Set(["user_scripts/adapter/storage-shim.js", ...manifest.content_scripts.flatMap(item => item.js), "user_scripts/adapter/loader.js"])];
+  // The page files, settings panel included, are there unchanged (apart from the version)
+  // and in the order meta.json gives; each appears once.
+  const files = [...meta.pageFiles, meta.loader];
   let position = 0;
   for (const file of files) {
     const part = `/* ${file} */\n${source(file)}\n`;
@@ -37,16 +54,30 @@ function checkFile() {
     position = at;
   }
   assert.ok(files.includes("src/settings-panel.js"));
-  console.log("PASS 油猴脚本头部、自动更新地址和打包内容正确，设置面板和扩展是同一份代码");
+  console.log("PASS 油猴脚本头部、自动更新地址和打包内容正确");
 }
 
 const settingsHost = "#__bilibili_thread_ripper_settings__";
 const openSettings = page => page.evaluate(() => document.dispatchEvent(new CustomEvent("btr-userscript-open-settings")));
 const settingsOf = page => page.evaluate(() => __biliThreadRipperDebug.getSettings());
+const themeOf = panel => panel.locator("#theme").getAttribute("data-value");
+// The theme button goes round its three choices: click it until the wanted one shows.
+async function chooseTheme(page, panel, value) {
+  for (let i = 0; i < 3 && await themeOf(panel) !== value; i += 1) {
+    await panel.locator("#theme").click();
+    await page.waitForFunction(chosen => __biliThreadRipperDebug.getSettings().theme === chosen, await themeOf(panel));
+  }
+  assert.equal(await themeOf(panel), value);
+}
 
 (async () => {
+  checkPublished();
+  const { buildUserscript } = await import(pathToFileURL(path.join(root, "scripts/build.mjs")).href);
+  script = buildUserscript(version);
+  fs.mkdirSync(path.join(root, "dist"), { recursive: true });
+  fs.writeFileSync(path.join(root, "dist/userscript-test.user.js"), script);
   checkFile();
-  const browser = await chromium.launch({ executablePath: process.env.BTR_CHROME_PATH || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", headless: true });
+  const browser = await chromium.launch({ executablePath: process.env.BTR_CHROME_PATH || undefined, headless: true });
   const origin = "http://127.0.0.1:18763/dev/userscript-test.html";
   const errors = [];
   const red = '.bubble[data-level="error"]:not(.leaving)';
@@ -57,30 +88,87 @@ const settingsOf = page => page.evaluate(() => __biliThreadRipperDebug.getSettin
     await page.goto(origin);
     const stored = (target = page) => target.evaluate(() => JSON.parse(localStorage.getItem("BTR_Userscript.sync") || "{}"));
 
-    // First run shows the same welcome panel as the extension, with the 0.9.1.2 defaults.
-    const welcome = page.locator("#__bilibili_thread_ripper_onboarding__");
-    await welcome.waitFor();
-    assert.equal(await welcome.locator('input[name="btr-onboarding-mode"]:checked').getAttribute("value"), "mainland");
-    assert.equal(await welcome.locator(".btr-onboarding-thread-value").textContent(), "8");
-    await welcome.locator(".btr-onboarding-save").click();
-    await welcome.waitFor({ state: "detached" });
-    const saved = await stored();
-    assert.deepEqual([saved.enabled, saved.mode, saved.concurrency, saved.errorNotices, saved.debugNotices], [true, "mainland", 8, false, false]);
+    // No welcome panel any more: in the userscript its "seen" flag lived in each bilibili
+    // domain's own localStorage, so it came back on every domain (issue #26). The settings
+    // are simply the defaults until something changes them.
+    await page.waitForFunction(() => window.__biliThreadRipperDebug?.getSettings().concurrency === 8);
+    assert.equal(await page.locator("#__bilibili_thread_ripper_onboarding__").count(), 0);
+    const settings = await settingsOf(page);
+    assert.deepEqual([settings.enabled, settings.mode, settings.concurrency, settings.autoConcurrency, settings.errorNotices, settings.debugNotices], [true, "mainland", 8, true, false, false]);
+    // The button in the page corner opens the panel, and closes it again.
+    const launcherButton = page.locator("#__bilibili_thread_ripper_launcher__ .btr-launcher");
+    await launcherButton.waitFor();
+    // Nothing BTR draws on the page can be selected as text, apart from fields to type in.
+    assert.equal(await launcherButton.evaluate(node => getComputedStyle(node).userSelect), "none");
+    await launcherButton.click();
+    await page.locator(`${settingsHost} .btr-popup`).waitFor();
+    assert.equal(await launcherButton.count(), 0, "悬浮按钮 steps aside while the panel is open");
+    await page.keyboard.press("Escape");
+    await page.locator(settingsHost).waitFor({ state: "detached" });
+    await launcherButton.waitFor();
     assert.equal(await page.evaluate(() => window.chrome?.storage), undefined, "the page's own chrome object must stay untouched");
     // The player menu keeps only what the extension puts there.
     const menu = page.locator("#__bilibili_thread_ripper_native_settings__");
     await menu.waitFor({ state: "attached" });
     assert.deepEqual(await menu.locator(".btr-native-setting-title").allTextContents(), ["线程撕裂者 CDN", "并发线程"]);
     assert.deepEqual(await menu.locator('input[name="btr-native-mode"]').evaluateAll(nodes => nodes.map(node => node.value)), ["mainland", "overseas", "custom"]);
-    console.log("PASS 首次打开显示欢迎设置；播放器菜单保持扩展原样");
+    assert.equal(await menu.evaluate(node => getComputedStyle(node).userSelect), "none");
+    console.log("PASS 不再弹欢迎设置；页面角落的悬浮按钮能打开设置；播放器菜单里的设置项齐全");
 
     // The menu command opens the settings panel inside the bilibili page, the same one the
     // extension's toolbar icon opens.
     await openSettings(page);
     const panel = page.locator(`${settingsHost} .btr-popup`);
     await panel.waitFor();
+    const palette = () => panel.evaluate(node => ({ theme: node.dataset.theme, background: getComputedStyle(node).backgroundColor, scheme: getComputedStyle(node).colorScheme }));
+    assert.deepEqual(await panel.evaluate(node => [getComputedStyle(node).userSelect, getComputedStyle(node.querySelector("#host-form input")).userSelect]), ["none", "text"]);
+    assert.equal(await themeOf(panel), "auto");
+    await page.emulateMedia({ colorScheme: "light" });
+    await page.waitForFunction(() => document.getElementById("__bilibili_thread_ripper_settings__").shadowRoot.querySelector(".btr-popup").dataset.theme === "light");
+    assert.deepEqual(await palette(), { theme: "light", background: "rgb(255, 255, 255)", scheme: "light" });
+    await page.emulateMedia({ colorScheme: "dark" });
+    await page.waitForFunction(() => document.getElementById("__bilibili_thread_ripper_settings__").shadowRoot.querySelector(".btr-popup").dataset.theme === "dark");
+    assert.deepEqual(await palette(), { theme: "dark", background: "rgb(23, 25, 31)", scheme: "dark" });
+    // The theme button, right of the GitHub icon, shows the choice in use. A click goes from
+    // 自动 to the colors the system is not showing, then to its own colors kept by hand, then
+    // back to 自动.
+    const shownTheme = async () => [await themeOf(panel), await panel.locator("#theme svg:visible").getAttribute("class"), (await palette()).theme];
+    const goRound = async () => {
+      const seen = [];
+      for (let i = 0; i < 3; i += 1) {
+        await panel.locator("#theme").click();
+        await page.waitForFunction(chosen => __biliThreadRipperDebug.getSettings().theme === chosen, await themeOf(panel));
+        seen.push(await shownTheme());
+      }
+      return seen;
+    };
+    assert.deepEqual(await shownTheme(), ["auto", "icon-auto", "dark"]);
+    assert.equal(await panel.locator("#theme").getAttribute("aria-label"), "面板主题：自动（跟随系统）。点击切换");
+    assert.deepEqual(await goRound(), [["light", "icon-light", "light"], ["dark", "icon-dark", "dark"], ["auto", "icon-auto", "dark"]]);
+    await page.emulateMedia({ colorScheme: "light" });
+    assert.deepEqual(await goRound(), [["dark", "icon-dark", "dark"], ["light", "icon-light", "light"], ["auto", "icon-auto", "light"]]);
+    await chooseTheme(page, panel, "light");
+    await page.emulateMedia({ colorScheme: "dark" });
+    assert.equal((await palette()).theme, "light", "explicit light ignores a dark system");
+    await chooseTheme(page, panel, "dark");
+    await page.emulateMedia({ colorScheme: "light" });
+    assert.equal((await palette()).theme, "dark", "explicit dark ignores a light system");
+    await page.screenshot({ path: "dist/theme-dark.png" });
+    await chooseTheme(page, panel, "light");
+    await page.screenshot({ path: "dist/theme-light.png" });
     assert.equal(await panel.locator("h1").textContent(), "线程撕裂者");
     assert.equal(await panel.locator("#enabled").isChecked(), true);
+    // 剧集加速 and 直播加速 sit in a block of their own, 剧集加速 with a line of explanation:
+    // episodes are sped up by default, live rooms only once switched on.
+    assert.deepEqual(await panel.locator(".accel-controls input").evaluateAll(nodes => nodes.map(node => [node.id, node.checked])), [["episode-enabled", true], ["live-enabled", false]]);
+    assert.deepEqual(await panel.locator(".accel-controls .accel-row small").evaluateAll(nodes => nodes.map(node => node.closest("label").htmlFor)), ["episode-enabled"]);
+    assert.equal(await panel.locator(".notice-controls #live-enabled").count(), 0);
+    // The panel shows the script's own icon.
+    assert.equal(await panel.locator("img.logo").getAttribute("src"), `data:image/png;base64,${fs.readFileSync(path.join(root, "icons/icon-128.png")).toString("base64")}`);
+    await panel.locator("#episode-enabled").setChecked(false, { force: true });
+    await page.waitForFunction(() => __biliThreadRipperDebug.getSettings().episodeEnabled === false);
+    await panel.locator("#episode-enabled").setChecked(true, { force: true });
+    await page.waitForFunction(() => __biliThreadRipperDebug.getSettings().episodeEnabled === true);
     assert.equal(await panel.locator('input[name="mode"][value="mainland"]').isChecked(), true);
     assert.equal(await panel.locator('input[name="mode"]').count(), 3);
     assert.equal(await panel.locator("#custom-hosts").isVisible(), false);
@@ -92,7 +180,8 @@ const settingsOf = page => page.evaluate(() => __biliThreadRipperDebug.getSettin
     await page.waitForFunction(() => __biliThreadRipperDebug.getSettings().takeover === "compat");
     await panel.locator('input[name="takeover"][value="full"]').check({ force: true });
     await page.waitForFunction(() => __biliThreadRipperDebug.getSettings().takeover === "full");
-    assert.equal(await panel.locator("#thread-value").textContent(), "8");
+    assert.equal(await panel.locator("#thread-value").textContent(), "自动");
+    assert.match(await panel.locator('label[for="auto-concurrency"]').textContent(), /^自动线程数（推荐）/);
     assert.equal(await panel.locator("#error-notices").isChecked(), false);
     assert.equal(await panel.locator("#debug-filters").isVisible(), false);
     await page.waitForFunction(() => __userscriptTest.statusRequests > 0);
@@ -104,6 +193,11 @@ const settingsOf = page => page.evaluate(() => __biliThreadRipperDebug.getSettin
     await page.waitForFunction(() => __biliThreadRipperDebug.getSettings().errorNotices === true);
     await page.evaluate(() => __BTR_RUNTIME_NOTICES__.log("打开后显示的错误", "这一小段没能下载下来", "error"));
     await page.locator(red).first().waitFor();
+    // The slider only counts once the automatic mode is switched off.
+    assert.equal(await panel.locator("#auto-concurrency").isChecked(), true);
+    assert.equal(await panel.locator("#concurrency").isDisabled(), true);
+    await panel.locator("#auto-concurrency").uncheck({ force: true });
+    await page.waitForFunction(() => __biliThreadRipperDebug.getSettings().autoConcurrency === false);
     await panel.locator("#concurrency").fill("2");
     await page.waitForFunction(() => __biliThreadRipperDebug.getSettings().concurrency === 16);
     assert.equal(await panel.locator("#thread-value").textContent(), "16");
@@ -111,7 +205,24 @@ const settingsOf = page => page.evaluate(() => __biliThreadRipperDebug.getSettin
     await panel.locator("#debug-filters").waitFor();
     assert.equal(await panel.locator("[data-debug-category]:checked").count(), 6);
     await page.locator(".mode").first().waitFor();
-    console.log("PASS 设置面板：开关、线程、Debug 分类和实时线程数都能用");
+    // The GitHub mark next to the title opens the project in a new tab.
+    const github = panel.locator("#github-link");
+    assert.deepEqual([await github.getAttribute("href"), await github.getAttribute("target")], ["https://github.com/MrTangLuyao/Bilibili-thread-ripper", "_blank"]);
+    assert.equal(await panel.locator("h1").textContent(), "线程撕裂者");
+    // With Debug on, "复制诊断信息" copies what a bug report needs, without signed addresses.
+    await page.evaluate(() => {
+      window.__copied = null;
+      Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text) => { window.__copied = text; } } });
+      __BTR_RUNTIME_NOTICES__.log("测试用的提示", "https://upos-sz-mirrorali.bilivideo.com/a.m4s?deadline=1&upsig=secret", "info", "", "", "download");
+    });
+    await page.waitForTimeout(400);
+    await panel.locator("#debug-copy").click();
+    await page.waitForFunction(() => typeof window.__copied === "string");
+    const copied = await page.evaluate(() => window.__copied);
+    for (const part of ["## 环境", `"BTR": "${version}"`, "## 设置", "## 视频接管", "## 最近的 Debug 提示", "测试用的提示"]) assert.ok(copied.includes(part), `the copy lacks ${part}`);
+    assert.equal(/upsig|deadline=/.test(copied), false, "a signed address got into the copy");
+    assert.match(await panel.locator("#debug-copy-status").textContent(), /已复制/);
+    console.log("PASS 设置面板：开关、线程、Debug 分类和实时线程数都能用；标题旁的 GitHub 图标指向项目；Debug 模式下能复制诊断信息，里面没有带签名的地址");
 
     // Closing stops the status polling; opening again starts clean.
     await page.keyboard.press("Escape");
@@ -169,16 +280,19 @@ const settingsOf = page => page.evaluate(() => __biliThreadRipperDebug.getSettin
     second.on("pageerror", error => errors.push(error.message));
     await second.goto(origin);
     await second.waitForFunction(() => window.__biliThreadRipperDebug?.getSettings().concurrency === 16);
-    assert.equal(await second.locator("#__bilibili_thread_ripper_onboarding__").count(), 0);
     await openSettings(second);
     const secondPanel = second.locator(`${settingsHost} .btr-popup`);
     await secondPanel.waitFor();
+    assert.equal(await themeOf(secondPanel), "light");
+    await chooseTheme(second, secondPanel, "dark");
+    await page.waitForFunction(() => __biliThreadRipperDebug.getSettings().theme === "dark");
     await secondPanel.locator('input[name="mode"][value="overseas"]').check({ force: true });
     await page.waitForFunction(() => __biliThreadRipperDebug.getSettings().mode === "overseas");
     await page.goto(origin);
     await page.waitForFunction(() => window.__biliThreadRipperDebug?.getSettings().mode === "overseas");
+    assert.equal((await settingsOf(page)).theme, "dark", "theme survives reload");
     assert.deepEqual(await settingsOf(page).then(value => [value.concurrency, value.errorNotices, value.debugNotices]), [16, true, true]);
-    console.log("PASS 另一个标签页同步设置，刷新后设置保留，不再弹欢迎设置");
+    console.log("PASS 另一个标签页同步设置，刷新后设置保留");
 
     // "自定义" in the gear menu opens the panel on the custom servers. Known servers are
     // ticked, others typed in; only Bilibili's video servers are taken, and what is typed
@@ -221,6 +335,111 @@ const settingsOf = page => page.evaluate(() => __biliThreadRipperDebug.getSettin
     await isolated.locator(settingsHost).waitFor({ state: "detached" });
     assert.equal(await isolated.locator("#__btr_notification_stack__").count() <= 1, true);
     console.log("PASS 油猴在独立环境运行时：核心只注入页面一次，油猴菜单“线程撕裂者设置”能打开和关闭设置页");
+
+    // Settings in the manager's storage, shared by every bilibili subdomain. Separate browser
+    // contexts stand in for subdomains: each has its own localStorage, all share the store.
+    const gmStores = new Map();
+    const gmStore = { get: key => gmStores.get("1")?.get(key) };
+    const gmPages = new Set();
+    const managerTab = async (seed) => {
+      const context = await browser.newContext();
+      if (seed) await context.addInitScript(value => { if (!sessionStorage.getItem("seeded")) { localStorage.setItem("BTR_Userscript.sync", value); sessionStorage.setItem("seeded", "1"); } }, JSON.stringify(seed));
+      await context.exposeBinding("__gmCall", async (source, op, key, value, storeId = "1") => {
+        if (!gmStores.has(storeId)) gmStores.set(storeId, new Map());
+        const store = gmStores.get(storeId);
+        if (op === "get") return store.get(key);
+        const old = store.get(key);
+        store.set(key, value);
+        for (const other of gmPages) {
+          if (other === source.page || other.isClosed()) continue;
+          await other.evaluate(([name, before, after, id]) => { if (window.__gmStoreId === id) __gmListeners.filter(item => item.key === name).forEach(item => item.callback(name, before, after, true)); }, [key, old, value, storeId]).catch(() => {});
+        }
+      });
+      const tab = await context.newPage();
+      tab.on("pageerror", error => errors.push(error.message));
+      gmPages.add(tab);
+      return tab;
+    };
+    const modeOf = (target, mode) => target.waitForFunction(value => window.__biliThreadRipperDebug?.getSettings().mode === value, mode);
+    // An empty manager ignores a previous manager's local copy and starts with defaults.
+    const space = await managerTab({ mode: "overseas", autoConcurrency: false, concurrency: 16 });
+    await space.goto(`${origin}?gm=live`);
+    await modeOf(space, "mainland");
+    await space.waitForFunction(() => JSON.parse(localStorage.getItem("BTR_Userscript.sync") || "{}").mode === "mainland");
+    assert.equal(JSON.parse(gmStore.get("sync")).mode, "mainland");
+    // Existing settings in this manager still win over a stale local copy.
+    gmStores.get("1").set("sync", JSON.stringify({ mode: "overseas", autoConcurrency: false, concurrency: 16 }));
+    await space.goto(`${origin}?gm=live`);
+    await modeOf(space, "overseas");
+    assert.equal(JSON.parse(gmStore.get("sync")).mode, "overseas");
+    assert.equal(JSON.parse(await space.evaluate(() => localStorage.getItem("BTR_Userscript.sync"))).mode, "overseas");
+    // Another subdomain, with nothing in its own localStorage, reads the same settings.
+    const video = await managerTab();
+    await video.goto(`${origin}?gm=live`);
+    await modeOf(video, "overseas");
+    assert.deepEqual(await settingsOf(video).then(value => [value.autoConcurrency, value.concurrency]), [false, 16]);
+    // A change on one shows on the other at once, is stored for both, and each subdomain keeps
+    // a copy in its own localStorage. A reload keeps it.
+    await openSettings(space);
+    const spacePanel = space.locator(`${settingsHost} .btr-popup`);
+    await spacePanel.waitFor();
+    await openSettings(video);
+    await video.emulateMedia({ colorScheme: "dark" });
+    const videoPanel = video.locator(`${settingsHost} .btr-popup`);
+    await chooseTheme(space, spacePanel, "light");
+    await video.waitForFunction(() => __biliThreadRipperDebug.getSettings().theme === "light");
+    assert.equal(await videoPanel.getAttribute("data-theme"), "light", "GM changes update an open panel on another subdomain");
+    assert.equal(JSON.parse(gmStore.get("sync")).theme, "light");
+    await chooseTheme(space, spacePanel, "auto");
+    await video.waitForFunction(() => __biliThreadRipperDebug.getSettings().theme === "auto");
+    assert.equal(await videoPanel.getAttribute("data-theme"), "dark", "auto resolves against each tab's own system preference");
+    await video.keyboard.press("Escape");
+    await spacePanel.locator('input[name="mode"][value="mainland"]').check({ force: true });
+    await modeOf(video, "mainland");
+    assert.equal(JSON.parse(gmStore.get("sync")).mode, "mainland");
+    assert.equal(JSON.parse(await video.evaluate(() => localStorage.getItem("BTR_Userscript.sync"))).mode, "mainland", "the other subdomain's copy follows");
+    await video.goto(`${origin}?gm=live`);
+    await modeOf(video, "mainland");
+    // A manager that does not report other tabs' changes: the tab reads the storage again
+    // when it comes back.
+    const plain = await managerTab();
+    await plain.goto(`${origin}?gm=plain`);
+    await modeOf(plain, "mainland");
+    await spacePanel.locator('input[name="mode"][value="overseas"]').check({ force: true });
+    await modeOf(video, "overseas");
+    assert.equal(await settingsOf(plain).then(value => value.mode), "mainland");
+    await plain.evaluate(() => dispatchEvent(new Event("focus")));
+    await modeOf(plain, "overseas");
+    // The same when the manager runs the script outside the page and injects it.
+    const injectedTab = await managerTab();
+    await injectedTab.goto(`${origin}?mode=sandbox&gm=live`);
+    await modeOf(injectedTab, "overseas");
+    await spacePanel.locator('input[name="mode"][value="mainland"]').check({ force: true });
+    await modeOf(injectedTab, "mainland");
+    // The diagnostic report names the manager (here one that describes itself like
+    // Violentmonkey in its "content" mode), its version and injection mode.
+    assert.equal(JSON.parse(await injectedTab.evaluate(() => __biliThreadRipperDebug.report())).scriptManager, "Violentmonkey 2.49.0 content");
+    // Moving to another manager starts independently, even with a current local copy.
+    await spacePanel.locator('input[name="mode"][value="custom"]').check({ force: true });
+    await modeOf(video, "custom");
+    await video.goto(`${origin}?gm=live&gmstore=2`);
+    await modeOf(video, "mainland");
+    await video.waitForFunction(() => JSON.parse(localStorage.getItem("BTR_Userscript.sync") || "{}").mode === "mainland");
+    assert.equal(JSON.parse(gmStores.get("2").get("sync")).mode, "mainland");
+    await video.goto(`${origin}?gm=live`);
+    await modeOf(video, "custom");
+    assert.equal(JSON.parse(gmStores.get("1").get("sync")).mode, "custom");
+    // A manager whose storage never answers must not keep the settings, and so the takeover,
+    // from loading: after three seconds this site's localStorage is used as before.
+    const silentContext = await browser.newContext();
+    await silentContext.addInitScript(() => localStorage.setItem("BTR_Userscript.sync", JSON.stringify({ mode: "overseas" })));
+    const silent = await silentContext.newPage();
+    silent.on("pageerror", error => errors.push(error.message));
+    const silentStarted = Date.now();
+    await silent.goto(`${origin}?gm=silent`);
+    await silent.waitForFunction(() => window.__biliThreadRipperDebug?.getSettings().mode === "overseas", null, { timeout: 8000 });
+    assert.ok(Date.now() - silentStarted < 6000);
+    console.log("PASS 管理器设置独立：不导入 localStorage，切回原管理器保留设置；跨子域与标签页同步、诊断和 localStorage 故障回退正常");
 
     assert.deepEqual(errors, []);
     console.log("PASS 没有脚本错误");

@@ -17,6 +17,23 @@
   const QUOTA_FATAL_AHEAD_SECONDS = 10;
   // A video whose buffer stays full through this many waits is given up after all.
   const QUOTA_MAX_WAITS = 8;
+
+  function playbackDeadlineAt(segmentStart, currentTime, playbackRate, now = performance.now()) {
+    const rate = Math.max(0.25, Math.abs(Number(playbackRate) || 1));
+    return now + Math.max(0, (Number(segmentStart) - Number(currentTime)) * 1000 / rate);
+  }
+
+  // Bilibili's core keeps the position it saved when it last reloaded its own source (a
+  // quality switch, or the retry it makes once BTR replaced the source) and seeks back to
+  // it every time the element reports new metadata, until the video ends or the page
+  // moves on. Every BTR session starts with new metadata, so after one such reload every
+  // drag of the progress bar and every quality switch ended up back at that old position.
+  // The moment of its last reload is known here, so its seek can be told from a viewer's
+  // and undone. Kept across players: the retake after a fallback is a new player.
+  let nativeRestore = { key: "", time: 0 };
+  function rememberNativeRestore(key, time) {
+    if (Number(time) >= 1) nativeRestore = { key, time: Number(time) };
+  }
   const QUALITY_NAMES = Object.freeze({
     127: "8K", 126: "杜比视界", 125: "HDR", 120: "4K", 116: "1080P 60帧",
     112: "1080P 高码率", 80: "1080P", 74: "720P 60帧", 64: "720P",
@@ -57,6 +74,13 @@
     return ["av1", "hevc", "avc"].includes(value) ? value : "";
   }
 
+  // The audio picked in the player: 0 the ordinary track, 1 杜比全景声, 2 Hi-Res 无损
+  // (Bilibili's own numbering, the newA of player.getQuality()).
+  function normalizeAudio(value) {
+    const audio = Math.trunc(Number(value)) || 0;
+    return audio === 1 || audio === 2 ? audio : 0;
+  }
+
   // "默认" in the player's 播放策略 menu keeps AV1 > HEVC > AVC. A codec picked there comes
   // first; a quality that does not have it falls back to that order.
   function codecPriority(representation, preferredCodec = "") {
@@ -86,8 +110,8 @@
 
   // preferredQuality is the quality chosen in the native menu; 0 is "auto" and keeps the
   // quality the playinfo itself asks for. preferredCodec is the codec chosen there, "" for
-  // "默认".
-  function selectRepresentations(playinfo, preferredQuality = 0, preferredCodec = "") {
+  // "默认". preferredAudio is the audio chosen there (see normalizeAudio).
+  function selectRepresentations(playinfo, preferredQuality = 0, preferredCodec = "", preferredAudio = 0) {
     const body = dashBody(playinfo);
     const dash = body?.dash;
     if (!dash) throw new Error("页面没有 DASH 播放清单");
@@ -106,10 +130,12 @@
       (Number(b.bandwidth) || 0) - (Number(a.bandwidth) || 0));
     // Dolby and Hi-Res sources keep their tracks in dash.dolby.audio / dash.flac.audio;
     // some of them have nothing in dash.audio at all, which used to fail the takeover.
-    // Ordinary tracks stay preferred, like the native player's default.
+    // The track picked in the player comes first when this browser can play it; otherwise
+    // the ordinary track, like the native player's default.
     const audioOf = (list) => [].concat(list || []).filter((item) => supported(item, "audio"))
       .sort((a, b) => (Number(b.bandwidth) || 0) - (Number(a.bandwidth) || 0))[0];
-    const audio = audioOf(dash.audio) || audioOf(dash.flac?.audio) || audioOf(dash.dolby?.audio);
+    const picked = { 1: dash.dolby?.audio, 2: dash.flac?.audio }[normalizeAudio(preferredAudio)];
+    const audio = audioOf(picked) || audioOf(dash.audio) || audioOf(dash.flac?.audio) || audioOf(dash.dolby?.audio);
     if (!videos.length || !audio) throw new Error("浏览器不支持清单中的视频或音频编码");
     const requestedQuality = Number(body?.quality || body?.qn) || 0;
     const preferred = [Number(preferredQuality) || 0, requestedQuality]
@@ -206,6 +232,7 @@
   // the page's error reporting. While a takeover is active, such a read answers with an
   // empty range instead; without one the browser behaves as before.
   let bufferedShimInstalled = false;
+  const ownSourceBuffers = new WeakSet();
   function installBufferedShim() {
     if (bufferedShimInstalled || !root.SourceBuffer) return;
     const descriptor = Object.getOwnPropertyDescriptor(root.SourceBuffer.prototype, "buffered");
@@ -222,7 +249,7 @@
         try {
           return descriptor.get.call(this);
         } catch (error) {
-          if (error?.name === "InvalidStateError" && document.querySelector('[data-btr-mse-active="true"]')) return emptyRanges;
+          if (error?.name === "InvalidStateError" && !ownSourceBuffers.has(this) && document.querySelector('[data-btr-mse-active="true"]')) return emptyRanges;
           throw error;
         }
       }
@@ -244,13 +271,102 @@
     leftoverGuardInstalled = true;
     root.addEventListener("error", (event) => {
       if (!NATIVE_LEFTOVER_RE.test(String(event.message || ""))) return;
-      if (!/hdslb\.com\/.*player/i.test(String(event.filename || ""))) return;
+      let source = null;
+      try { source = new URL(String(event.filename || "")); } catch (_error) { return; }
+      if (!/(^|\.)hdslb\.com$/i.test(source.hostname) || !/\/player\//i.test(source.pathname)) return;
       if (!document.querySelector('[data-btr-mse-active="true"]')) return;
       nativeLeftovers.suppressed += 1;
       nativeLeftovers.last = String(event.message || "").slice(0, 120);
       event.preventDefault();
       event.stopImmediatePropagation();
     }, true);
+  }
+
+  // Bilibili's player attaches its own MediaSource to the element and creates its source
+  // buffers a moment after it opens. A takeover that replaced the element's source in
+  // between closed that MediaSource under it, so its addSourceBuffer threw, and Bilibili took
+  // that for "this browser cannot play the codec" (#29): it stopped using HEVC in the whole
+  // tab, so 杜比视界 and HDR vanished from the quality menu, it stopped offering Hi-Res and
+  // Dolby audio on the page, and it restarted at a lower quality. The page's MediaSources
+  // are remembered by their object URL, and a takeover waits while the element holds one
+  // that is open without its buffers.
+  const pageMediaSources = new Map();
+  const ownMediaSources = new WeakSet();
+  const NATIVE_SOURCE_WAIT_MS = 1000;
+  let mediaSourceWatchInstalled = false;
+  function installMediaSourceWatch() {
+    if (mediaSourceWatchInstalled || typeof root.URL?.createObjectURL !== "function") return;
+    mediaSourceWatchInstalled = true;
+    const createObjectURL = root.URL.createObjectURL;
+    root.URL.createObjectURL = function (object) {
+      const url = createObjectURL.apply(this, arguments);
+      if (object instanceof root.MediaSource) {
+        pageMediaSources.set(url, object);
+        if (pageMediaSources.size > 16) pageMediaSources.delete(pageMediaSources.keys().next().value);
+      }
+      return url;
+    };
+  }
+
+  // Resolves once Bilibili's MediaSource on the element has its buffers, has closed, or after
+  // a second at most. null when there is nothing to wait for.
+  function nativeSourceSettled(video) {
+    const source = (video.srcObject instanceof root.MediaSource ? video.srcObject : null)
+      || pageMediaSources.get(video.src) || pageMediaSources.get(video.currentSrc);
+    if (!source || ownMediaSources.has(source) || source.readyState !== "open" || source.sourceBuffers.length >= 2) return null;
+    return new Promise((resolve) => {
+      let grace = null;
+      const done = () => {
+        clearTimeout(limit);
+        clearTimeout(grace);
+        source.sourceBuffers.removeEventListener("addsourcebuffer", added);
+        source.removeEventListener("sourceclose", done);
+        source.removeEventListener("sourceended", done);
+        resolve();
+      };
+      // Video and audio are added one right after the other; a source with a single track
+      // only costs the short grace period.
+      const added = () => {
+        if (source.sourceBuffers.length >= 2) done();
+        else if (!grace) grace = setTimeout(done, 150);
+      };
+      const limit = setTimeout(done, NATIVE_SOURCE_WAIT_MS);
+      source.sourceBuffers.addEventListener("addsourcebuffer", added);
+      source.addEventListener("sourceclose", done);
+      source.addEventListener("sourceended", done);
+    });
+  }
+
+  // Should Bilibili still record a codec failure while BTR plays, the failure is about BTR's
+  // takeover and not about the browser, yet it would keep HEVC and the Hi-Res / Dolby tracks
+  // off for the rest of the tab (sessionStorage) or, when its server asks for it, for days
+  // (localStorage). While a takeover is active those records are not written.
+  const CODEC_FAILURE_KEYS = new Set(["enableHEVCError", "enableAV1Error", "decodeHEVCError", "decodeAV1Error", "bilibili_decode_error_obj"]);
+  const codecFailures = { blocked: 0, last: "" };
+  let codecFailureGuardInstalled = false;
+  function installCodecFailureGuard() {
+    const storage = root.Storage?.prototype;
+    if (codecFailureGuardInstalled || typeof storage?.setItem !== "function") return;
+    codecFailureGuardInstalled = true;
+    const setItem = storage.setItem;
+    storage.setItem = function (key, value) {
+      if (CODEC_FAILURE_KEYS.has(String(key)) && document.querySelector('[data-btr-mse-active="true"]')) {
+        codecFailures.blocked += 1;
+        codecFailures.last = String(key);
+        return;
+      }
+      return setItem.apply(this, arguments);
+    };
+    // Versions up to 0.9.4.2 could leave such records behind; they are cleared once.
+    try {
+      if (root.localStorage.getItem("BTR.codecFailuresCleared") !== "1") {
+        for (const key of CODEC_FAILURE_KEYS) {
+          root.localStorage.removeItem(key);
+          root.sessionStorage.removeItem(key);
+        }
+        setItem.call(root.localStorage, "BTR.codecFailuresCleared", "1");
+      }
+    } catch (_error) {}
   }
 
   function createNativePlayer(options) {
@@ -260,19 +376,24 @@
     let currentPlayinfo = options.playinfo;
     let preferredQuality = Math.max(0, Math.trunc(Number(options.preferredQuality)) || 0);
     let preferredCodec = normalizeCodec(options.preferredCodec);
-    let selection = selectRepresentations(currentPlayinfo, preferredQuality, preferredCodec);
+    const preferredAudio = normalizeAudio(options.preferredAudio);
+    let selection = selectRepresentations(currentPlayinfo, preferredQuality, preferredCodec, preferredAudio);
     let selectedVideo = selection.preferred;
     // The two representation objects the running session downloads from. Its resolvers keep
     // reading them, so fresh addresses always go into these two and never into a newer
     // selection's copies.
     let selectedAudio = selection.audio;
     let sessionStarts = 0;
+    let sessionRequests = 0;
     let session = null;
     let destroyed = false;
     let generationSequence = 0;
     let seekTimer = null;
     let seekReloads = 0;
     let seekRequestedAt = 0;
+    let nativeRestoresUndone = 0;
+    const restoreKey = options.identity?.key || representationPath(selection.preferred) || "";
+    if (nativeRestore.key !== restoreKey) nativeRestore = { key: restoreKey, time: 0 };
     let seekStartedAt = 0;
     let seekSettledAt = 0;
     let lastSeekMs = 0;
@@ -293,6 +414,7 @@
       if (destroyed || !candidate || candidate.disposed || video.src === candidate.objectUrl) return;
       if (candidate.externalSourceDetected) return;
       candidate.externalSourceDetected = true;
+      rememberNativeRestore(restoreKey, video.currentTime);
       candidate.controller.abort(new DOMException("B站原生播放器正在切换媒体源", "AbortError"));
       clearInterval(candidate.timer);
       clearTimeout(candidate.endRetryTimer);
@@ -454,12 +576,18 @@
     }
 
     function segmentDownload(candidate, track, segment, index, downloadOptions = {}) {
+      // Read again at every check of the downloader: a new playback rate, or the playhead
+      // standing still during a stall, moves the deadline of pieces already on their way.
+      const deadlineAt = Number.isFinite(Number(downloadOptions.deadlineAt))
+        ? Number(downloadOptions.deadlineAt)
+        : () => playbackDeadlineAt(segment.startTime, Number(video.currentTime) || candidate.startTime, video.playbackRate);
       return downloader.downloadRange(segment, track.resolver, {
         signal: generationSignal(candidate),
         parallel: true,
         kind: track.kind,
         priority: downloadOptions.priority,
         hurry: downloadOptions.hurry === true,
+        deadlineAt,
         startup: downloadOptions.startup === true,
         onStartupScheduled: downloadOptions.onStartupScheduled,
         onOrderedChunk: downloadOptions.onOrderedChunk || null
@@ -495,7 +623,10 @@
         const index = track.startupIndex + 1;
         track.followupScheduled = true;
         const segment = track.sidx.segments[index];
-        if (segment) track.prefetches.set(index, segmentDownload(candidate, track, segment, index, { priority: 70, hurry: true }));
+        if (segment) track.prefetches.set(index, segmentDownload(candidate, track, segment, index, {
+          priority: 70,
+          hurry: true
+        }));
       }
       ensureBuffer(candidate);
     }
@@ -570,10 +701,12 @@
           if (!settled.result.streamed) {
             try {
               await append(candidate, track, settled.result.bytes, generation);
+              if (!sessionIsCurrent(candidate) || generation !== candidate.generation || signal.aborted) break;
               track.held = null;
             } catch (error) {
               // With this little buffered there is nothing left to give up, and waiting
               // would only stall the video: that stays a failure, as it always was.
+              if (!sessionIsCurrent(candidate) || generation !== candidate.generation || signal.aborted) break;
               if (!error?.bufferFull || error.aheadSeconds < QUOTA_FATAL_AHEAD_SECONDS) throw error;
               candidate.quotaWaits += 1;
               if (candidate.quotaWaits > QUOTA_MAX_WAITS) throw error;
@@ -581,6 +714,7 @@
               break;
             }
           }
+          if (!sessionIsCurrent(candidate) || generation !== candidate.generation || signal.aborted) break;
           if (!track.startupComplete && settled.index === track.startupIndex) {
             note("first segment in", `${track.kind} ${Math.round(settled.result.byteLength / 1024)} KiB in ${settled.result.pieceCount} pieces`);
             track.startupComplete = true;
@@ -604,7 +738,12 @@
       if (!candidate || !sessionIsCurrent(candidate) || candidate.fatal || candidate.streamEnded || candidate.ending) return;
       if (!candidate.tracks.length || !candidate.tracks.every((track) => track.complete)) return;
       candidate.ending = true;
+      const generation = candidate.generation;
+      // A seek inside the session opens a new generation whose tracks are not complete: an
+      // end prepared by the old one is dropped.
+      const stillWanted = () => generation === candidate.generation && candidate.tracks.every((track) => track.complete);
       Promise.all(candidate.tracks.map((track) => track.operation.catch(() => {}))).then(() => {
+        if (!stillWanted()) return;
         if (!sessionIsCurrent(candidate) || candidate.fatal || candidate.streamEnded || candidate.mediaSource.readyState !== "open") return;
         if (candidate.tracks.some((track) => track.sourceBuffer.updating)) {
           candidate.ending = false;
@@ -619,6 +758,7 @@
         candidate.streamEnded = true;
         publishState();
       }).catch((error) => {
+        if (!stillWanted()) return;
         candidate.ending = false;
         if (sessionIsCurrent(candidate) && error?.name !== "InvalidStateError") fatal(candidate, error);
         else if (sessionIsCurrent(candidate)) {
@@ -759,7 +899,18 @@
     }
 
     async function startSession(representation, playbackState) {
+
+      downloaderFactory.autoConcurrency?.newSession();
       if (destroyed) return;
+      const request = ++sessionRequests;
+      const settling = nativeSourceSettled(video);
+      if (settling) {
+        const waitedFrom = performance.now();
+        await settling;
+        note("waited for Bilibili's source buffers", `${Math.round(performance.now() - waitedFrom)} ms`);
+        // A later start replaced this one meanwhile.
+        if (destroyed || request !== sessionRequests) return;
+      }
       options.onLog?.("正在准备播放器", `使用 ${qualityLabel(representation)} 清晰度，从 ${Number(playbackState.time || 0).toFixed(2)} 秒开始。`, "info", "takeover");
       const previous = session;
       // Read once: selection can be replaced by a new playinfo while this session starts.
@@ -769,6 +920,7 @@
       sessionStarts += 1;
       note("session", `${qualityLabel(representation)} ${codecFamily(representation)} from ${Number(playbackState.time || 0).toFixed(1)}`);
       const mediaSource = new MediaSource();
+      ownMediaSources.add(mediaSource);
       const objectUrl = URL.createObjectURL(mediaSource);
       const candidate = {
         disposed: false, fatal: false, externalSourceDetected: false, generation: 0,
@@ -784,7 +936,7 @@
         volume: playbackState.volume, muted: playbackState.muted, playbackRate: playbackState.playbackRate,
         startTime: Math.max(0, Number(playbackState.time) || 0),
         forceStartTime: Boolean(playbackState.forceTime),
-        internalSeekTarget: null,
+        internalSeekTarget: null, metadataAt: 0, restoreUndoneAt: 0,
         // One ban list per video, shared by every quality and by the audio track.
         videoResolver: resolverFactory.createResolver(representation, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts),
         audioResolver: resolverFactory.createResolver(audio, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts)
@@ -806,6 +958,8 @@
         if (!sessionIsCurrent(candidate)) return;
         const videoBuffer = mediaSource.addSourceBuffer(mimeFor(representation, "video"));
         const audioBuffer = mediaSource.addSourceBuffer(mimeFor(audio, "audio"));
+        ownSourceBuffers.add(videoBuffer);
+        ownSourceBuffers.add(audioBuffer);
         const [videoTrack, audioTrack] = await Promise.all([
           loadTrack(candidate, "video", representation, candidate.videoResolver, videoBuffer, candidate.startTime),
           loadTrack(candidate, "audio", audio, candidate.audioResolver, audioBuffer, candidate.startTime)
@@ -845,6 +999,8 @@
     async function seekWithinSession(candidate, target) {
       const previousGeneration = candidate.generationController;
       openGeneration(candidate);
+      // 自动线程数 judges the buffer ahead of the playhead: the new position starts that watch afresh.
+      downloaderFactory.autoConcurrency?.newSession();
       // The segments of the position left behind are no longer wanted.
       previousGeneration?.abort(new DOMException("已经跳到新的位置", "AbortError"));
       candidate.startTime = target;
@@ -853,6 +1009,11 @@
       clearTimeout(candidate.endRetryTimer);
       candidate.quotaWaits = 0;
       for (const track of candidate.tracks) {
+        // Queued, so it runs after whatever write is in progress and before the new
+        // position's first one: the parser forgets any half-written segment.
+        queuedSourceOperation(candidate, track, async () => {
+          if (candidate.mediaSource.readyState === "open") track.sourceBuffer.abort();
+        }).catch(() => {});
         track.prefetches.clear();
         track.held = null;
         track.complete = false;
@@ -916,6 +1077,21 @@
     }
 
     function scheduleSeek() {
+      const candidate = session;
+      const target = Number(video.currentTime) || 0;
+      if (candidate && sessionIsCurrent(candidate) && !candidate.playbackActivated && candidate.metadataAt
+        && performance.now() - candidate.metadataAt < 250 && candidate.restoreUndoneAt !== candidate.metadataAt
+        && nativeRestore.time && Math.abs(target - nativeRestore.time) < 1 && Math.abs(target - candidate.startTime) >= 0.5) {
+        // The core restores once per metadata; a second seek to that position is the viewer's.
+        candidate.restoreUndoneAt = candidate.metadataAt;
+        nativeRestoresUndone += 1;
+        note("native restore undone", `${target.toFixed(1)} -> ${candidate.startTime.toFixed(1)}`);
+        options.onLog?.("挡住了 B 站播放器的回跳", `B 站的播放内核想跳回 ${target.toFixed(1)} 秒，保持在你选的 ${candidate.startTime.toFixed(1)} 秒。`, "info", "buffer");
+        setCurrentTimeInternal(candidate, candidate.startTime);
+        // Its restore also plays or pauses as things were back then; the viewer's intent wins.
+        if (!candidate.resumeWanted && !video.paused) video.pause();
+        return;
+      }
       seekRequestedAt = performance.now();
       clearTimeout(seekTimer);
       seekTimer = setTimeout(() => {
@@ -924,13 +1100,24 @@
       }, 140);
     }
 
+    video.addEventListener("loadedmetadata", () => { if (session) session.metadataAt = performance.now(); }, { signal: eventController.signal });
     video.addEventListener("seeking", scheduleSeek, { signal: eventController.signal });
-    video.addEventListener("timeupdate", () => ensureBuffer(), { signal: eventController.signal });
+    video.addEventListener("timeupdate", () => {
+      ensureBuffer();
+      // 自动线程数 watches the buffer ahead of the playhead while playing.
+      const candidate = session;
+      if (candidate && sessionIsCurrent(candidate) && candidate.playbackActivated && candidate.tracks.length && core.normalizeSettings(getSettings()).autoConcurrency) {
+        const current = Number(video.currentTime) || 0;
+        const ahead = Math.max(0, Math.min(...candidate.tracks.map((track) => bufferedEndAt(track.sourceBuffer, current))) - current);
+        downloaderFactory.autoConcurrency?.buffer(ahead, !video.paused && !video.seeking);
+      }
+    }, { signal: eventController.signal });
     video.addEventListener("waiting", () => {
       const candidate = session;
       note("waiting", candidate?.playbackActivated ? "after start" : "before start");
       if (candidate && sessionIsCurrent(candidate) && candidate.playbackActivated) {
         candidate.startupWaitingEvents += 1;
+        if (!video.seeking && !video.paused && core.normalizeSettings(getSettings()).autoConcurrency) downloaderFactory.autoConcurrency?.stall("播放卡了一下");
         if (seekSettledAt && performance.now() - seekSettledAt < 15000 && !video.seeking) stallsAfterSeek += 1;
         if (performance.now() - candidate.playbackActivatedAt <= STARTUP_PROTECTION_MS && !candidate.recovering && !video.seeking) {
           candidate.recovering = true;
@@ -981,7 +1168,7 @@
     function namesOlderAddresses(playinfo) {
       const listed = (item) => {
         const dash = dashBody(item)?.dash;
-        return [...(dash?.video || []), ...(dash?.audio || [])];
+        return [...(dash?.video || []), ...(dash?.audio || []), ...[].concat(dash?.dolby?.audio || [], dash?.flac?.audio || [])];
       };
       const known = [...listed(currentPlayinfo), selectedVideo, selectedAudio].filter(Boolean);
       return listed(playinfo).some((item) => {
@@ -1013,7 +1200,7 @@
 
     async function updatePlayinfo(playinfo) {
       if (destroyed) return;
-      const next = selectRepresentations(playinfo, preferredQuality, preferredCodec);
+      const next = selectRepresentations(playinfo, preferredQuality, preferredCodec, preferredAudio);
       // Bilibili's page and the timed refresh both bring playinfos, and the one that arrives
       // last is not always the newer one. An older one is dropped whole: kept as the current
       // playinfo it would hand its addresses to the next session, after a seek or a quality
@@ -1061,6 +1248,8 @@
       delete video.dataset.btrMediaEngine;
       delete options.container.dataset.btrMseActive;
       if (resumeNative && original.src) {
+        // Bilibili's core reloads from here and remembers this position (see nativeRestore).
+        rememberNativeRestore(restoreKey, state.time || original.currentTime);
         video.src = original.src;
         video.volume = original.volume;
         video.muted = original.muted;
@@ -1116,12 +1305,14 @@
       urlDeadlineSeconds,
       video,
       getDebug: () => ({
-        version: "0.9.4.3",
+        version: "__BTR_VERSION__",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,
         preferredQuality,
         preferredCodec,
+        preferredAudio,
+        codecFailuresBlocked: codecFailures.blocked,
         sessionStarts,
         codec: codecFamily(selectedVideo),
         width: Number(selectedVideo?.width) || 0,
@@ -1145,6 +1336,7 @@
         lastNativeLeftover: nativeLeftovers.last,
         progressiveAppends: session?.progressiveAppends || 0,
         seekReloads,
+        nativeRestoresUndone,
         lastSeekMs: Math.round(lastSeekMs),
         stallsAfterSeek,
         timeline: timeline.slice(),
@@ -1155,5 +1347,7 @@
 
   installBufferedShim();
   installNativeErrorGuard();
-  root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = Object.freeze({ createNativePlayer, qualityLabel, selectRepresentations });
+  installMediaSourceWatch();
+  installCodecFailureGuard();
+  root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = Object.freeze({ createNativePlayer, playbackDeadlineAt, qualityLabel, selectRepresentations });
 })(globalThis);

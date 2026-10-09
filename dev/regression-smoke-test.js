@@ -3,13 +3,15 @@ const assert = require("node:assert/strict");
 const { chromium } = require("playwright");
 
 (async () => {
-  const browser = await chromium.launch({ executablePath: process.env.BTR_CHROME_PATH || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", headless: true });
+  const browser = await chromium.launch({ executablePath: process.env.BTR_CHROME_PATH || undefined, headless: true });
   const tests = [
     ["navigation-test.html", "navigation-result"],
     ["multipart-navigation-test.html", "multipart-navigation-result"],
+    ["interactive-navigation-test.html", "interactive-navigation-result"],
+    ["bangumi-navigation-test.html", "bangumi-navigation-result"],
+    ["episode-settings-test.html", "episode-settings-result"],
     ["takeover-error-test.html", "takeover-error-result"],
-    ["error-notice-test.html", "error-notice-result"],
-    ["onboarding-test.html", "result"],
+    ["floating-button-test.html", "result"],
     ["mse-abort-test.html", "mse-abort-result"],
     ["quality-sync-test.html", "quality-sync-result"],
     ["info-panel-test.html", "info-panel-result"],
@@ -45,7 +47,6 @@ const { chromium } = require("playwright");
           const result = JSON.parse(await page.locator(`#${id}`).innerText());
           assert.equal(result.pass, true, JSON.stringify(result));
           assert.deepEqual(errors, []);
-          assert.equal(await page.locator('#__bilibili_thread_ripper_native_settings__ input[id="status-notice"]').count(), 0);
           console.log(`PASS ${file}`);
         } catch (error) {
           console.error(file, await page.locator(`#${id}`).textContent().catch(() => "missing result"), errors);

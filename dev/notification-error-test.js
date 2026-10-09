@@ -24,7 +24,7 @@ function mockChrome() {
 }
 
 (async () => {
-  const browser = await chromium.launch({ executablePath: process.env.BTR_CHROME_PATH || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", headless: true, args: ["--disable-background-timer-throttling"] });
+  const browser = await chromium.launch({ executablePath: process.env.BTR_CHROME_PATH || undefined, headless: true, args: ["--disable-background-timer-throttling"] });
   const errors = [];
   const origin = "http://127.0.0.1:18763";
   // The settings panel opens inside a bilibili page; this tab is one without a video.
@@ -47,7 +47,7 @@ function mockChrome() {
     assert.equal(await popup.locator("#debug-notices").isChecked(), false);
     assert.equal(await popup.locator("#debug-filters").isVisible(), false);
     assert.equal(await popup.locator("[data-debug-category]:checked").count(), 6);
-    assert.equal(await popup.locator("#thread-value").textContent(), "8");
+    assert.equal(await popup.locator("#thread-value").textContent(), "自动");
     assert.equal(await page.evaluate(() => __biliThreadRipperDebug.getSettings().errorNotices), false);
     assert.equal(await page.evaluate(() => __biliThreadRipperDebug.getSettings().concurrency), 8);
     // Red errors stay hidden until the user turns the switch on.
@@ -76,6 +76,7 @@ function mockChrome() {
     assert(delivered.some(item => item.title === "需要保留的错误"));
     assert(!JSON.stringify(delivered).includes("PRIVATE"));
     assert((await page.locator(red).count()) >= 1);
+    assert.equal(await page.locator("#__btr_notification_stack__ .stack").evaluate(node => getComputedStyle(node).userSelect), "none");
     assert((await page.locator(red + " .heading").allTextContents()).every(title => title === "BTR 提示"));
     assert.equal(await page.locator(".mode").count(), 0);
     console.log("PASS 打开显示错误后，Debug 关闭时仍捕获真实媒体错误与 Range 下载错误，仅显示红色");
@@ -103,6 +104,29 @@ function mockChrome() {
     assert.equal(await home.locator("#__bilibili_thread_ripper_error_notice__").count(), 0);
     await popup.locator("#error-notices").check();
     await home.locator("#__bilibili_thread_ripper_error_notice__").waitFor({ state: "visible" });
+    // Keep the former error-notice fixture's unique assertions here, using the same
+    // storage and cross-tab setup as the error switch checks.
+    const takeoverNotice = home.locator("#__bilibili_thread_ripper_error_notice__");
+    assert.equal(await takeoverNotice.locator(".btr-error-title").innerText(), "BTR 提示");
+    await takeoverNotice.locator(".btr-error-toggle").click();
+    assert.equal(await takeoverNotice.getAttribute("data-expanded"), "true");
+    assert.match(await takeoverNotice.locator(".btr-error-log").textContent(), /失败测试/);
+    assert.match(await takeoverNotice.locator(".btr-error-log").textContent(), /playinfo/);
+    // The box cannot be selected as text, only its log, which is there to be copied.
+    assert.deepEqual(await takeoverNotice.evaluate(node => [getComputedStyle(node).userSelect, getComputedStyle(node.querySelector(".btr-error-log")).userSelect]), ["none", "text"]);
+    await home.evaluate(() => {
+      window.__retryObserved = false;
+      addEventListener("message", event => {
+        if (event.source === window && event.data?.channel === "__BILI_RANGE_ACCELERATOR_V1__" && event.data.type === "retry-takeover") window.__retryObserved = true;
+      });
+    });
+    await takeoverNotice.locator(".btr-error-retry").click();
+    await home.waitForFunction(() => window.__retryObserved);
+    await home.evaluate(() => window.postMessage({ channel: "__BILI_RANGE_ACCELERATOR_V1__", type: "stats", payload: { playerState: "ready", takeoverError: null } }, "*"));
+    await takeoverNotice.waitFor({ state: "detached" });
+    // Recreate the error so switching the setting off still checks removal independently.
+    await home.evaluate(() => window.postMessage({ channel: "__BILI_RANGE_ACCELERATOR_V1__", type: "stats", payload: { playerState: "error", takeoverError: { id: "test-error-again", at: Date.now(), message: "失败测试", stage: "playinfo", retryCount: 1 } } }, "*"));
+    await takeoverNotice.waitFor({ state: "visible" });
     await popup.locator("#error-notices").uncheck();
     await home.locator("#__bilibili_thread_ripper_error_notice__").waitFor({ state: "detached" });
     await page.goto(origin + "/dev/notification-test.html");

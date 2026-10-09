@@ -89,8 +89,13 @@
     const requested = Math.trunc(Number(source.concurrency));
     return {
       enabled: source.enabled !== false,
-      // The live module on live.bilibili.com; the master switch above still rules.
-      liveEnabled: source.liveEnabled !== false,
+      theme: ["light", "dark"].includes(source.theme) ? source.theme : "auto",
+      // The live module on live.bilibili.com; the master switch above still rules. Off unless
+      // switched on: a viewer who never chose keeps Bilibili's own live player.
+      liveEnabled: source.liveEnabled === true,
+      // 剧集加速: episode pages (/bangumi/play/ep… and ss…: anime, films, documentaries, …),
+      // sped up in the compatibility mode only.
+      episodeEnabled: source.episodeEnabled !== false,
       // "full" replaces Bilibili's playback core; "compat" leaves it in charge and only
       // downloads its media requests.
       takeover: source.takeover === "compat" ? "compat" : "full",
@@ -99,10 +104,20 @@
         .map(normalizeCdnHost)
         .filter((host, index, all) => host && all.indexOf(host) === index)
         .slice(0, 32),
+      // The round button in the page corner that opens the settings panel, and where the
+      // viewer dragged it: which side, and how far down as a share of the window height.
+      floatingButton: source.floatingButton !== false,
+      // Where the viewer dragged it, as shares of the window (0 = flush left, 1 = flush
+      // right); null when it was never moved.
+      floatingButtonLeft: source.floatingButtonLeft != null && Number(source.floatingButtonLeft) >= 0 && Number(source.floatingButtonLeft) <= 1 ? Number(source.floatingButtonLeft) : null,
+      floatingButtonTop: source.floatingButtonTop != null && Number(source.floatingButtonTop) >= 0 && Number(source.floatingButtonTop) <= 1 ? Number(source.floatingButtonTop) : null,
       debugNotices: source.debugNotices === true,
       errorNotices: source.errorNotices === true,
       debugCategories: Object.fromEntries(["takeover", "playback", "download", "buffer", "settings", "other"].map(key => [key, source.debugCategories?.[key] !== false])),
       concurrency: allowed.includes(requested) ? requested : 8,
+      // 自动线程数: the downloader picks the thread count itself, between 8 and 64, and
+      // `concurrency` above is only what the viewer set by hand. Off unless asked for.
+      autoConcurrency: source.autoConcurrency === true,
       minChunkBytes: 64 * 1024,
       firstByteTimeoutMs: 5500,
       stallTimeoutMs: 4000,

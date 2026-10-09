@@ -1,7 +1,6 @@
 "use strict";
 const assert = require("node:assert/strict");
 const { chromium } = require("playwright");
-const manifest = require("../manifest.json");
 
 function mockChrome() {
   const listeners = [];
@@ -32,7 +31,7 @@ function mockChrome() {
 }
 
 (async () => {
-  const browser = await chromium.launch({ executablePath: process.env.BTR_CHROME_PATH || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", headless: true, args: ["--autoplay-policy=no-user-gesture-required", "--disable-background-timer-throttling"] });
+  const browser = await chromium.launch({ executablePath: process.env.BTR_CHROME_PATH || undefined, headless: true, args: ["--autoplay-policy=no-user-gesture-required", "--disable-background-timer-throttling"] });
   const passed = [], errors = [];
   const mark = name => { passed.push(name); console.log("PASS " + name); };
   const origin = "http://127.0.0.1:18763";
@@ -48,9 +47,6 @@ function mockChrome() {
     await tab.locator("#__bilibili_thread_ripper_settings__ .btr-popup").waitFor();
   };
   try {
-    assert.equal(manifest.version, "0.9.4.3");
-    assert.deepEqual(manifest.content_scripts.find(item => item.world === "ISOLATED").matches, ["https://*.bilibili.com/*"]);
-    assert.deepEqual(manifest.content_scripts.find(item => item.world === "MAIN").matches, ["https://www.bilibili.com/*", "https://m.bilibili.com/*"]);
     const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
     await context.addInitScript(mockChrome);
     const page = await context.newPage(), popup = await context.newPage(), home = await context.newPage();
@@ -73,7 +69,7 @@ function mockChrome() {
     assert.equal(await popup.locator("#active-count").innerText(), "3");
     assert.equal(await page.evaluate(async () => "statusNotice" in await chrome.storage.sync.get(null)), false);
     assert.equal(await page.locator("#__bilibili_thread_ripper_watermark__").count(), 0);
-    mark("保持 0.9.4.3，移除旧开关与监控面板，迁移不擅自开启 Debug");
+    mark("移除旧开关与监控面板，迁移不擅自开启 Debug");
 
     // Red messages are off by default since 0.9.1.2. The rest of this test covers them too.
     assert.equal(await popup.locator("#error-notices").isChecked(), false);

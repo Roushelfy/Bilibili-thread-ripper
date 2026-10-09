@@ -8,6 +8,19 @@
   const PIECE_RETRY_WINDOW_MS = 25000;
   // Below this a resumed request saves less than its own round trip costs.
   const RESUME_MIN_BYTES = 32 * 1024;
+  // Hedging a piece with a playback deadline (see hedgeDue): a first copy projected to finish
+  // this long before the deadline gets no copy yet; one receiving at least HEDGE_PACE of the
+  // usual connection speed is on pace; a copy's node measured HEDGE_FASTER times faster than the
+  // first copy is receiving is worth a copy anyway.
+  const HEDGE_SLACK_MS = 1500;
+  const HEDGE_PACE = 0.6;
+  const HEDGE_FASTER = 1.5;
+  // Queue classes, served in this order: the startup probe and init/index, then startup
+  // pieces, then everything else. A class never waits behind a lower one.
+  const QUEUE_CRITICAL = 0, QUEUE_STARTUP = 1, QUEUE_ORDINARY = 2;
+  // Priority an ordinary request with a playback deadline gains per millisecond of waiting:
+  // 20 (a hedge copy's boost) in 0.9 s.
+  const QUEUE_AGING_PER_MS = 20 / 900;
   // A shorter transfer is mostly round trip. The tail of a resumed piece can be a few KiB,
   // and counting it would mark down the very node that came to the rescue.
   const SPEED_SAMPLE_MIN_BYTES = 48 * 1024;
@@ -31,7 +44,34 @@
     }
 
     drain() {
+      try { this.drainQueue(); } finally { this.onChange?.(this.active, this.limit, this.queue.length); }
+    }
+
+    drainQueue() {
       while (this.active < this.limit && this.queue.length) {
+        const now = performance.now();
+        const urgency = entry => {
+          // Read again at every pass: the player's deadline moves with the playhead and the
+          // playback rate, and a queued piece may have become due while it waited.
+          const deadlineAt = entry.deadline ? entry.deadline() : entry.deadlineAt;
+          if (!Number.isFinite(deadlineAt)) return 0;
+          const remaining = deadlineAt - now;
+          if (remaining <= 0) return 12;
+          if (remaining <= 750) return 9;
+          if (remaining <= 2000) return 6;
+          return 0;
+        };
+        // A bounded, recomputed boost prevents overdue primaries from sitting behind
+        // prefetch work without turning the queue back into strict deadline ordering. A
+        // request with a deadline also gains priority while it waits, so a piece queued long
+        // ago is not passed over again and again by newer ones of a slightly higher priority;
+        // requests without one (compatibility mode, the desktop client) keep the fixed order.
+        // Sorting inside the class keeps the startup probe, init and index, and then the
+        // startup pieces, ahead of ordinary media whatever the boosts add up to.
+        const rank = entry => entry.priority + urgency(entry)
+          + (entry.ages ? (now - entry.queuedAt) * QUEUE_AGING_PER_MS : 0);
+        this.queue.sort((a, b) => a.queueClass - b.queueClass || rank(b) - rank(a)
+          || a.sequence - b.sequence);
         const entry = this.queue.shift();
         entry.signal?.removeEventListener("abort", entry.cancel);
         if (entry.signal?.aborted) {
@@ -48,7 +88,9 @@
       }
     }
 
-    acquire(signal, priority = 0) {
+    // deadline: a function giving the clock time playback needs this request, or null; the
+    // fixed deadlineAt is what callers without one pass.
+    acquire(signal, priority = 0, deadlineAt = Infinity, queueClass = QUEUE_CRITICAL, ages = false, deadline = null) {
       if (signal?.aborted) return Promise.reject(abortError(signal.reason));
       return new Promise((resolve, reject) => {
         const entry = {
@@ -57,6 +99,11 @@
           signal,
           released: false,
           priority: Number(priority) || 0,
+          deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : Infinity,
+          deadline,
+          queueClass,
+          ages,
+          queuedAt: performance.now(),
           sequence: this.sequence++
         };
         entry.cancel = () => {
@@ -68,11 +115,255 @@
         };
         signal?.addEventListener("abort", entry.cancel, { once: true });
         this.queue.push(entry);
-        this.queue.sort((a, b) => b.priority - a.priority || a.sequence - b.sequence);
         this.drain();
+        this.onChange?.(this.active, this.limit, this.queue.length);
       });
     }
   }
+
+  // 自动线程数. One controller for the whole page: the thread count starts at 8 and climbs a
+  // ladder towards 64 on every sign that the download is not keeping up with playback
+  // (the player stalls; a low buffer stops growing while bytes keep arriving; a
+  // connection waits too long for its first byte while every slot is busy). Every step up
+  // is a trial: ten seconds later the bytes per second must have grown, otherwise the
+  // step is taken back to where it started and that level rests for a while — more
+  // connections that bring nothing only add risk. A server refusing the load (412, 429)
+  // steps it back too, and nothing climbs past a refused level until it has rested. The
+  // level is kept across videos on the same page; a new page starts at 8 again.
+  //
+  // Each start (a new video, a seek outside the buffer) opens with at least 16 threads: the
+  // first seconds are when a slow node turns into a spinning wheel. Once the buffer is well
+  // ahead, the count steps back down to the level the page had before. A sign of not keeping
+  // up meanwhile climbs as usual and ends the start there; so does half a minute without
+  // catching up. From then on the rules above carry on.
+  const AUTO_LADDER = Object.freeze([8, 12, 16, 24, 32, 48, 64]);
+  const AUTO_STARTUP_LEVEL = 2;
+  const AUTO_STARTUP_COMFORT_SECONDS = 15;
+  const AUTO_STARTUP_MAX_MS = 30000;
+  const AUTO_STEP_COOLDOWN_MS = 2500;
+  const AUTO_TRIAL_MS = 10000;
+  const AUTO_WINDOW_MS = 5000;
+  const AUTO_BUCKET_MS = 250;
+  const AUTO_REST_MS = 90000;
+  const AUTO_PUSHBACK_REST_MS = 180000;
+  const AUTO_LOW_BUFFER_SECONDS = 6;
+  const AUTO_PRESSURE_MS = 1000;
+  const AUTO_ACTIVITY_MS = 1500;
+
+  function createAutoConcurrency({ now = () => performance.now() } = {}) {
+    const listeners = new Set();
+    const state = {
+      level: 0, changedAt: 0, reason: "起步", steps: 0, trial: null,
+      // level index -> { until, hard }: hard rests (refusals) also cap every level above.
+      resting: new Map(),
+      buckets: [], lastActivityAt: -Infinity,
+      // Time the connections spent saturated: intervals of { from, to } within the window.
+      saturated: false, saturatedSince: 0, saturatedSpans: [],
+      aheadSamples: [], pressureSince: 0,
+      // The start of a session while it runs above the page's own level: { base, until }.
+      startup: null
+    };
+    const threads = () => AUTO_LADDER[state.level];
+
+    function pruneBuckets(at) {
+      while (state.buckets.length && at - state.buckets[0].at > AUTO_WINDOW_MS) state.buckets.shift();
+    }
+
+    // Bytes per second over the window, from completed pieces only: a hedge copy that lost
+    // its race is not delivery.
+    function throughput(at = now()) {
+      pruneBuckets(at);
+      if (!state.buckets.length) return 0;
+      const bytes = state.buckets.reduce((sum, item) => sum + item.bytes, 0);
+      // Over the time between the first and the last delivery in the window: an idle tail
+      // (nothing wanted) is not slowness.
+      return bytes * 1000 / Math.max(1000, state.buckets.at(-1).at - state.buckets[0].at + AUTO_BUCKET_MS);
+    }
+
+    // The share of the window during which every slot was busy and pieces were queued.
+    function saturation(at = now()) {
+      const from = at - AUTO_WINDOW_MS;
+      state.saturatedSpans = state.saturatedSpans.filter((span) => span.to > from);
+      let busy = state.saturatedSpans.reduce((sum, span) => sum + Math.max(0, span.to - Math.max(span.from, from)), 0);
+      if (state.saturated) busy += Math.max(0, at - Math.max(state.saturatedSince, from));
+      return Math.min(1, busy / AUTO_WINDOW_MS);
+    }
+
+    function resting(level, at) {
+      const rest = state.resting.get(level);
+      if (!rest) return null;
+      if (rest.until <= at) { state.resting.delete(level); return null; }
+      return rest;
+    }
+
+    function setLevel(level, reason, trial) {
+      const previous = threads();
+      const at = now();
+      state.level = level;
+      state.changedAt = at;
+      state.reason = reason;
+      state.steps += 1;
+      state.trial = trial || null;
+      state.pressureSince = 0;
+      for (const listener of listeners) {
+        try { listener({ threads: threads(), previous, reason }); } catch (_error) {}
+      }
+    }
+
+    // Up one level. A level resting after a refusal caps the climb; one resting after a
+    // fruitless trial is skipped only by a strong signal (a stall), not by pressure.
+    function stepUp(reason, strong) {
+      const at = now();
+      if (at - state.changedAt < AUTO_STEP_COOLDOWN_MS) return false;
+      if (resting(state.level, at)?.hard) return false;
+      let next = state.level + 1;
+      while (next < AUTO_LADDER.length) {
+        const rest = resting(next, at);
+        if (!rest) break;
+        if (rest.hard || !strong) return false;
+        next += 1;
+      }
+      if (next >= AUTO_LADDER.length) return false;
+      setLevel(next, reason, { from: state.level, level: next, at, baseline: throughput(at), stalled: false });
+      // Not keeping up even with the start's threads: the start ends at this level.
+      state.startup = null;
+      return true;
+    }
+
+    // How high a start may go: up to 16 threads, but not onto or past a level the server
+    // refused (a fruitless trial does not hold it back; the start comes down on its own).
+    function startupLevel(at) {
+      if (resting(state.level, at)?.hard) return state.level;
+      let level = state.level;
+      while (level < AUTO_STARTUP_LEVEL && !resting(level + 1, at)?.hard) level += 1;
+      return level;
+    }
+
+    function stepDown(target, restLevel, reason, restMs, hard) {
+      state.resting.set(restLevel, { until: now() + restMs, hard });
+      if (target >= state.level) return false;
+      setLevel(target, reason, null);
+      return true;
+    }
+
+    // A step up has had its time: did the extra connections deliver? Only judged when the
+    // connections were busy meanwhile; an idle download (buffer full) proves nothing, and
+    // so does a stall in between. Without any gain the step goes back to where it started.
+    function judgeTrial(at) {
+      const trial = state.trial;
+      if (!trial || at - trial.at < AUTO_TRIAL_MS) return;
+      state.trial = null;
+      if (trial.stalled || saturation(at) < 0.6 || trial.baseline <= 0) return;
+      if (throughput(at) < trial.baseline) {
+        stepDown(trial.from, trial.level, `${AUTO_LADDER[trial.level]} 线程没有比 ${AUTO_LADDER[trial.from]} 线程更快`, AUTO_REST_MS, false);
+      }
+    }
+
+    return Object.freeze({
+      ladder: AUTO_LADDER,
+      threads,
+      subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+      // A piece arrived whole.
+      delivered(bytes, at = now()) {
+        const last = state.buckets.at(-1);
+        if (last && at - last.at < AUTO_BUCKET_MS) last.bytes += bytes;
+        else state.buckets.push({ at, bytes });
+        pruneBuckets(at);
+        judgeTrial(at);
+      },
+      // Bytes are flowing on some connection right now.
+      activity(at = now()) {
+        state.lastActivityAt = at;
+      },
+      // The connections' state whenever it changes.
+      demand(active, limit, queued, at = now()) {
+        const saturated = active >= limit && queued > 0;
+        if (saturated === state.saturated) return;
+        if (state.saturated) state.saturatedSpans.push({ from: state.saturatedSince, to: at });
+        state.saturated = saturated;
+        state.saturatedSince = at;
+        saturation(at);
+      },
+      // The player stalled: more threads at once.
+      stall(reason = "播放卡了一下") {
+        if (state.trial) state.trial.stalled = true;
+        return stepUp(reason, true);
+      },
+      // The buffer ahead of the playhead, a few times a second while playing. A low buffer
+      // that has not grown over the last second although bytes keep arriving, for a whole
+      // second, means the connections are too few.
+      buffer(ahead, playing, at = now()) {
+        state.aheadSamples.push({ at, ahead });
+        while (state.aheadSamples.length && at - state.aheadSamples[0].at > AUTO_PRESSURE_MS + AUTO_BUCKET_MS) state.aheadSamples.shift();
+        // The start: once well ahead, one step back down per cooldown towards the page's level.
+        const start = state.startup;
+        if (start && at >= start.until) state.startup = null;
+        else if (start && ahead >= AUTO_STARTUP_COMFORT_SECONDS && at - state.changedAt >= AUTO_STEP_COOLDOWN_MS) {
+          if (state.level > start.base) setLevel(state.level - 1, `开头已经跟上，线程数降到 ${AUTO_LADDER[state.level - 1]}`, null);
+          if (state.level <= start.base) state.startup = null;
+        }
+        const earlier = state.aheadSamples.find((item) => at - item.at >= AUTO_PRESSURE_MS);
+        const downloading = at - state.lastActivityAt < AUTO_ACTIVITY_MS;
+        const pressed = playing && downloading && ahead < AUTO_LOW_BUFFER_SECONDS && earlier && ahead <= earlier.ahead + 0.05;
+        if (!pressed) { state.pressureSince = 0; return false; }
+        if (!state.pressureSince) { state.pressureSince = at; return false; }
+        if (at - state.pressureSince < AUTO_PRESSURE_MS) return false;
+        state.pressureSince = 0;
+        return stepUp("缓冲跟不上播放", false);
+      },
+      // A connection waited too long for its first byte while every slot was busy.
+      slow() {
+        return saturation() >= 0.6 ? stepUp("连接排队等太久", false) : false;
+      },
+      // The server refused the load: back one level, and nothing climbs past this one for
+      // a while.
+      pushback(status) {
+        return stepDown(Math.max(0, state.level - 1), state.level, `服务器返回 ${status}`, AUTO_PUSHBACK_REST_MS, true);
+      },
+      // A new playback session: what the buffer did before means nothing now, and the start
+      // runs with more threads. A session that begins while another one's start is still
+      // running keeps the page's own level to come back to.
+      newSession() {
+        const at = now();
+        state.aheadSamples.length = 0;
+        state.pressureSince = 0;
+        state.trial = null;
+        state.buckets.length = 0;
+        state.saturatedSpans.length = 0;
+        if (state.saturated) state.saturatedSince = at;
+        const base = state.startup ? state.startup.base : state.level;
+        const target = startupLevel(at);
+        if (target > state.level) setLevel(target, `开头先用 ${AUTO_LADDER[target]} 线程`, null);
+        state.startup = state.level > base ? { base, until: at + AUTO_STARTUP_MAX_MS } : null;
+      },
+      status() {
+        const at = now();
+        return {
+          threads: threads(), level: state.level, reason: state.reason, steps: state.steps, changedAt: state.changedAt,
+          throughputBps: Math.round(throughput(at)), saturation: Math.round(saturation(at) * 100) / 100,
+          buckets: state.buckets.length, activityAgeMs: Math.round(at - state.lastActivityAt),
+          resting: [...state.resting.entries()].filter(([, rest]) => rest.until > at).map(([level, rest]) => ({ threads: AUTO_LADDER[level], hard: rest.hard, forMs: Math.round(rest.until - at) })),
+          trial: state.trial ? { from: AUTO_LADDER[state.trial.from], level: AUTO_LADDER[state.trial.level], ageMs: Math.round(at - state.trial.at), baselineBps: Math.round(state.trial.baseline), stalled: state.trial.stalled } : null,
+          startup: state.startup ? { base: AUTO_LADDER[state.startup.base], forMs: Math.round(state.startup.until - at) } : null
+        };
+      },
+      reset() {
+        state.level = 0; state.changedAt = 0; state.reason = "起步"; state.steps = 0; state.trial = null;
+        state.resting.clear(); state.buckets.length = 0; state.lastActivityAt = -Infinity;
+        state.saturated = false; state.saturatedSince = 0; state.saturatedSpans.length = 0;
+        state.aheadSamples.length = 0; state.pressureSince = 0; state.startup = null;
+      }
+    });
+  }
+  const autoConcurrency = createAutoConcurrency();
+  // Every downloader on the page follows the controller's count at once.
+  const autoFollowers = new Set();
+  autoConcurrency.subscribe(() => {
+    for (const ref of autoFollowers) {
+      const follow = ref.deref();
+      if (follow) follow(); else autoFollowers.delete(ref);
+    }
+  });
 
   function createDownloader(options) {
     const nativeFetch = options.nativeFetch || root.fetch.bind(root);
@@ -82,15 +373,24 @@
     // tells whether the previous normalization is still valid.
     let rawSettings = null;
     let normalizedSettings = null;
+    let autoView = null;
     function config() {
       const raw = getSettings();
       if (raw !== rawSettings || !normalizedSettings) {
         rawSettings = raw;
         normalizedSettings = core.normalizeSettings(raw);
+        autoView = null;
       }
-      return normalizedSettings;
+      if (!normalizedSettings.autoConcurrency) return normalizedSettings;
+      // In the automatic mode the thread count is the controller's, everything else the viewer's.
+      const threads = autoConcurrency.threads();
+      if (!autoView || autoView.concurrency !== threads) autoView = { ...normalizedSettings, concurrency: threads };
+      return autoView;
     }
     const semaphore = new Semaphore(config().concurrency);
+    const applySettings = () => semaphore.setLimit(config().concurrency);
+    autoFollowers.add(new WeakRef(applySettings));
+    semaphore.onChange = (active, limit, queued) => { if (config().autoConcurrency) autoConcurrency.demand(active, limit, queued); };
 
     // What one connection typically delivers here and how long a sub-chunk typically
     // takes. Sub-chunk sizing and the hedge delay follow these measurements.
@@ -117,16 +417,97 @@
     // A second copy starts once a piece takes clearly longer than pieces have been
     // taking, instead of always waiting the full fixed delay.
     function hedgeDelayMs(settings) {
-      if (!meter.pieceMs) return settings.hedgeDelayMs;
-      return Math.max(250, Math.min(settings.hedgeDelayMs, Math.round(meter.pieceMs * 1.5)));
+      return meter.pieceMs
+        ? Math.max(250, Math.min(settings.hedgeDelayMs, Math.round(meter.pieceMs * 1.5)))
+        : settings.hedgeDelayMs;
     }
 
-    async function readBody(response, controller, transferId, settings, received) {
+    // Whether the second copy of a piece with a playback deadline should start now. Checked
+    // every 50 ms once the first copy holds a connection (a copy of a request still queued
+    // would only queue as well, and with its higher priority take the connection meant for
+    // it). first: the first copy (when it started, bytes received, bytes asked for); the delay
+    // counts from its start. copyBps: the measured speed of the copy's node, 0 when unknown.
+    // - No data yet, or nothing new for a whole delay (stopped): copy.
+    // - A deadline it meets with time to spare at its speed so far: no copy yet, the bandwidth
+    //   goes to pieces needed sooner.
+    // - The copy's node known to be clearly faster: copy.
+    // - Slower than connections usually are: copy.
+    // - On pace: a copy on a node known to be no faster only takes the next piece's connection
+    //   and bandwidth; one on a node not measured yet is tried, as the chance of a faster one.
+    //   A piece that will miss its deadline even so may spend one of the range's rescue slots
+    //   on that node anyway: its measurement can be stale (a node that was slow a minute ago
+    //   may have recovered), and waiting for the request to time out costs far more.
+    function hedgeDue(first, delayMs, deadlineAt, copyBps, rescue) {
+      const now = performance.now(), ran = now - first.startedAt;
+      const got = first.recorder.bytes;
+      if (got !== first.seenBytes) {
+        first.seenBytes = got;
+        first.seenAt = now;
+      }
+      if (ran < delayMs) return false;
+      if (!got || now - first.seenAt >= delayMs) return true;
+      const rate = got * 1000 / ran;
+      if (now + Math.max(0, first.length - got) * 1000 / rate <= deadlineAt - HEDGE_SLACK_MS) return false;
+      if (copyBps > rate * HEDGE_FASTER) return true;
+      if (!(meter.connectionBps > 0) || rate < meter.connectionBps * HEDGE_PACE) return true;
+      if (!(copyBps > 0)) return true;
+      return now + Math.max(0, first.length - got) * 1000 / rate > deadlineAt
+        && Boolean(rescue?.claimStale?.());
+    }
+
+    // When playback needs a range, as a clock time; Infinity when the caller did not say.
+    // options.deadlineAt is that time, options.deadlineMs the time left; either can be a
+    // function, read again at every check, so a new playback rate or position also moves the
+    // deadline of pieces already on their way.
+    function deadlineOf(options) {
+      const read = (value, relative) => {
+        const ms = Number(value);
+        if (value == null || !Number.isFinite(ms)) return Infinity;
+        return relative ? performance.now() + Math.max(0, ms) : ms;
+      };
+      const live = (value, relative) => () => {
+        try { return read(value(), relative); } catch (_error) { return Infinity; }
+      };
+      if (typeof options.deadlineAt === "function") return live(options.deadlineAt, false);
+      if (options.deadlineAt != null && Number.isFinite(Number(options.deadlineAt))) {
+        const fixed = Number(options.deadlineAt);
+        return () => fixed;
+      }
+      if (typeof options.deadlineMs === "function") return live(options.deadlineMs, true);
+      const fixed = read(options.deadlineMs, true);
+      return () => fixed;
+    }
+
+    // Only measured per-request progress can spend this bounded rescue budget. The second
+    // budget is for pieces that will miss their deadline while their copy's node is measured
+    // as no faster: that measurement can be stale, and a bounded number of such copies per
+    // range is far cheaper than waiting for a timeout.
+    function createEarlyHedge(limit) {
+      return {
+        progressRemaining: Math.max(0, limit),
+        claimProgress() {
+          if (this.progressRemaining <= 0) return false;
+          this.progressRemaining -= 1;
+          return true;
+        },
+        // At least one per range, even where no connection is held back (a single-piece
+        // download): one request is much cheaper than waiting out a timeout.
+        staleRemaining: Math.max(1, limit),
+        claimStale() {
+          if (this.staleRemaining <= 0) return false;
+          this.staleRemaining -= 1;
+          return true;
+        }
+      };
+    }
+
+    async function readBody(response, controller, transferId, settings, received, report = onTransfer) {
       if (!response.body?.getReader) {
         const bytes = new Uint8Array(await response.arrayBuffer());
         received.bytes += bytes.byteLength;
         received.chunks?.push(bytes);
-        onTransfer({ phase: "progress", id: transferId, bytes: bytes.byteLength });
+        if (settings.autoConcurrency) autoConcurrency.activity();
+        report({ phase: "progress", id: transferId, bytes: bytes.byteLength });
         return bytes;
       }
       const reader = response.body.getReader();
@@ -156,7 +537,8 @@
           // The recorder keeps what a failed attempt already received, so a retry or a
           // hedge copy can ask only for the missing tail.
           received.chunks?.push(chunk);
-          onTransfer({ phase: "progress", id: transferId, bytes: chunk.byteLength });
+          if (settings.autoConcurrency) autoConcurrency.activity();
+          report({ phase: "progress", id: transferId, bytes: chunk.byteLength });
         }
       } finally {
         clearTimeout(stallTimer);
@@ -175,9 +557,12 @@
     // begin: called once the request has its connection slot, and returns what to ask for.
     // A copy that waited in the queue resumes from what the first copy has received by then,
     // not from what it had when the copy was queued.
-    async function attempt(piece, url, signal, kind, resolver, priority = 0, begin = null) {
+    async function attempt(piece, url, signal, kind, resolver, priority = 0, begin = null,
+      deadline = null, observeProgress = null, queueClass = QUEUE_CRITICAL) {
       const settings = config();
-      const release = await semaphore.acquire(signal, priority);
+      const deadlineAt = deadline ? deadline() : Infinity;
+      const release = await semaphore.acquire(signal, priority, deadlineAt, queueClass,
+        queueClass === QUEUE_ORDINARY && Number.isFinite(deadlineAt), deadline);
       let received = { bytes: 0, chunks: [] };
       if (begin) {
         try {
@@ -195,8 +580,18 @@
       else signal?.addEventListener("abort", cancel, { once: true });
       const firstByteTimer = setTimeout(() => controller.abort(new DOMException("CDN 首字节超时", "TimeoutError")), settings.firstByteTimeoutMs);
       const totalTimer = setTimeout(() => controller.abort(new DOMException("CDN 子块总耗时超限", "TimeoutError")), settings.attemptTimeoutMs);
-      const transferId = onTransfer({ phase: "start", kind, totalBytes: piece.length, url });
       const startedAt = performance.now();
+      const report = event => {
+        const elapsedMs = Math.max(1, performance.now() - startedAt);
+        const bps = received.bytes * 1000 / elapsedMs;
+        const remaining = Math.max(0, piece.length - received.bytes);
+        const payload = { ...event, receivedBytes: received.bytes, totalBytes: piece.length,
+          bps, etaMs: bps > 0 ? Math.round(remaining * 1000 / bps) : null };
+        observeProgress?.({ ...payload, elapsedMs });
+        return onTransfer(payload);
+      };
+      const transferId = report({ phase: "start", kind, totalBytes: piece.length, url,
+        deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null });
       try {
         const response = await nativeFetch(url, {
           method: "GET",
@@ -215,13 +610,13 @@
           // The status tells a refused signed address (4xx) apart from a node that is down.
           throw Object.assign(new Error(`Range 校验失败：HTTP ${response.status}`), { status: response.status });
         }
-        const bytes = await readBody(response, controller, transferId, settings, received);
+        const bytes = await readBody(response, controller, transferId, settings, received, report);
         if (bytes.byteLength !== piece.length) throw new Error(`子块长度不符：${bytes.byteLength}/${piece.length}`);
         const elapsedMs = Math.max(1, performance.now() - startedAt);
         recordMeter(bytes.byteLength, elapsedMs);
         // The node answered either way; only a large enough transfer says how fast it is.
         resolver.success(url, bytes.byteLength >= SPEED_SAMPLE_MIN_BYTES ? bytes.byteLength * 1000 / elapsedMs : 0);
-        onTransfer({ phase: "done", id: transferId });
+        report({ phase: "done", id: transferId });
         return { bytes, total: contentRange.total, url };
       } catch (error) {
         const canceled = error?.name === "AbortError";
@@ -234,7 +629,11 @@
         }
         // Received bytes tell a dead node (0 KiB) apart from a transfer that stalled midway.
         resolver.failure(url, error, received.bytes);
-        onTransfer({ phase: canceled ? "cancel" : "error", id: transferId, error });
+        if (settings.autoConcurrency) {
+          if (error?.status === 412 || error?.status === 429) autoConcurrency.pushback(error.status);
+          else if (!canceled && error?.name === "TimeoutError" && received.bytes === 0) autoConcurrency.slow();
+        }
+        report({ phase: canceled ? "cancel" : "error", id: transferId, error });
         throw error;
       } finally {
         clearTimeout(firstByteTimer);
@@ -294,7 +693,10 @@
       return candidates;
     }
 
-    async function downloadPiece(piece, resolver, signal, kind, preferredUrls, startupMode = false, priority = 0) {
+    async function downloadPiece(piece, resolver, signal, kind, preferredUrls, startupMode = false, priority = 0,
+      deadline = null, earlyHedge = null) {
+      const hasDeadline = Boolean(deadline) && Number.isFinite(deadline());
+      const deadlineNow = () => (deadline ? deadline() : Infinity);
       const settings = config();
       const allowed = (url) => typeof resolver.allows !== "function" || resolver.allows(url);
       const startup = startupMode === true || startupMode === "probe";
@@ -349,18 +751,63 @@
           // for the rest of the hedge delay.
           let firstFailed = () => {};
           const firstFailure = new Promise((resolve) => { firstFailed = resolve; });
+          let firstStartedAt = 0, deadlineDeficitSamples = 0, firstBecameStraggler = () => {};
+          const firstStraggler = new Promise((resolve) => { firstBecameStraggler = resolve; });
+          const observeFirst = event => {
+            if (!hasDeadline || event.phase !== "progress" || !Number.isFinite(event.etaMs)) return;
+            const deadlineAt = deadlineNow();
+            const missesDeadline = Number.isFinite(deadlineAt)
+              && event.etaMs >= Math.max(0, deadlineAt - performance.now());
+            const slowerThanPeers = meter.connectionBps > 0 && event.bps < meter.connectionBps * 0.5
+              && event.etaMs >= 500;
+            const remainingToDeadline = deadlineAt - performance.now();
+            deadlineDeficitSamples = Number.isFinite(deadlineAt)
+              && event.etaMs - remainingToDeadline >= 250
+              ? deadlineDeficitSamples + 1
+              : 0;
+            // A clearly slow node is rescued immediately. If the whole route is slow,
+            // two consecutive deficit samples may spend the same one-per-range budget.
+            if (Number.isFinite(deadlineAt)
+              && ((missesDeadline && slowerThanPeers) || deadlineDeficitSamples >= 2)) {
+              firstBecameStraggler();
+            }
+          };
           const contexts = [];
           const attempts = pair.map((url, pairIndex) => (async () => {
             if (pairIndex) await new Promise((resolve, reject) => {
-              const delay = probe ? 0 : startup ? Math.min(250, settings.hedgeDelayMs) : hedgeDelayMs(settings);
-              const timer = setTimeout(resolve, delay);
-              firstFailure.then(() => {
-                clearTimeout(timer);
-                resolve();
+              let timer = null, settled = false, earlyClaimed = false;
+              const finish = (operation) => {
+                if (settled) return;
+                settled = true;
+                if (timer) clearTimeout(timer);
+                controllers[pairIndex].signal.removeEventListener("abort", canceled);
+                operation();
+              };
+              const measured = hedgeDelayMs(settings);
+              const delay = probe ? 0 : startup
+                ? Math.min(hasDeadline ? 200 : 250, measured)
+                : measured;
+              const copyBps = () => (typeof resolver.speed === "function" ? resolver.speed(url) || 0 : 0);
+              // A playback-deadline request decides once its first copy has a connection (see
+              // hedgeDue); one without a deadline (compatibility mode, the desktop client)
+              // keeps main's delay from the moment the piece asked, queue time included.
+              const check = () => {
+                if (settled) return;
+                if (contexts[0] && hedgeDue(contexts[0], delay, deadlineNow(), copyBps(), earlyHedge)) return finish(resolve);
+                timer = setTimeout(check, 50);
+              };
+              if (hasDeadline && !probe) timer = setTimeout(check, 0);
+              else timer = setTimeout(() => finish(resolve), delay);
+              firstStraggler.then(() => {
+                if (settled || probe || earlyClaimed || !earlyHedge?.claimProgress?.()) return;
+                earlyClaimed = true;
+                if (timer) clearTimeout(timer);
+                const grace = Math.max(0, 250 - (performance.now() - firstStartedAt));
+                timer = setTimeout(() => finish(resolve), grace);
               });
+              firstFailure.then(() => finish(resolve));
               const canceled = () => {
-                clearTimeout(timer);
-                reject(abortError(controllers[pairIndex].signal.reason));
+                finish(() => reject(abortError(controllers[pairIndex].signal.reason)));
               };
               if (controllers[pairIndex].signal.aborted) canceled();
               else controllers[pairIndex].signal.addEventListener("abort", canceled, { once: true });
@@ -370,13 +817,15 @@
             let base = null;
             const recorder = { bytes: 0, chunks: [] };
             const begin = () => {
+              if (!pairIndex) firstStartedAt = performance.now();
               base = prefix && prefix.bytes >= RESUME_MIN_BYTES ? prefix : null;
               if (pairIndex) {
                 const live = liveProgress(contexts[0]);
                 if (live && live.bytes >= RESUME_MIN_BYTES && live.bytes > (base?.bytes || 0)) base = live;
               }
               if (base && base.bytes >= piece.length) base = null;
-              contexts[pairIndex] = { base, recorder };
+              const startedAt = performance.now();
+              contexts[pairIndex] = { base, recorder, startedAt, seenBytes: 0, seenAt: startedAt, length: piece.length - (base?.bytes || 0) };
               return {
                 recorder,
                 part: base
@@ -385,7 +834,9 @@
               };
             };
             try {
-              const result = await attempt(piece, url, controllers[pairIndex].signal, kind, resolver, priority + (pairIndex ? 20 : 0), begin);
+              const result = await attempt(piece, url, controllers[pairIndex].signal, kind, resolver,
+                priority + (pairIndex ? 20 : 0), begin, deadline, pairIndex ? null : observeFirst,
+                probe ? QUEUE_CRITICAL : startup ? QUEUE_STARTUP : QUEUE_ORDINARY);
               return base
                 ? { bytes: core.concatChunks([...base.chunks, result.bytes], piece.length), total: result.total, url: result.url }
                 : result;
@@ -400,6 +851,7 @@
             controllers.forEach((controller) => {
               if (!controller.signal.aborted) controller.abort(new DOMException("并发副本已取消", "AbortError"));
             });
+            if (settings.autoConcurrency) autoConcurrency.delivered(piece.length);
             return winner;
           } catch (aggregate) {
             lastError = aggregate?.errors?.at?.(-1) || aggregate;
@@ -584,7 +1036,8 @@
         options.kind || "media",
         candidateUrls,
         "probe",
-        220
+        220,
+        options.deadline
       );
       await options.onOrderedChunk(headResult.bytes, head, headResult.total);
       if (head.end >= range.end) {
@@ -633,6 +1086,7 @@
       const measured = typeof resolver.speed === "function" ? (url) => resolver.speed(url) > 0 : () => false;
       const provenUrls = candidateUrls.filter((url) => url === headResult.url || measured(url));
       const primaries = assignPrimaries(provenUrls.length ? provenUrls : [headResult.url], resolver, pieces.length);
+      const earlyHedge = createEarlyHedge(rescueReserve);
       const pendingPieces = pieces.map(async (piece, orderedIndex) => {
         const result = await downloadPiece(
           piece,
@@ -641,7 +1095,9 @@
           options.kind || "media",
           preferredFor(primaries[orderedIndex], [headResult.url, ...candidateUrls.filter((url) => url !== headResult.url)]),
           true,
-          120 - Math.min(30, piece.index)
+          120 - Math.min(30, piece.index),
+          options.deadline,
+          earlyHedge
         );
         ordered[orderedIndex] = result;
         await flushOrdered();
@@ -665,9 +1121,12 @@
     async function downloadRange(range, resolver, options = {}) {
       const settings = config();
       if (options.kind === "meta") return downloadStartupRange(range, resolver, options);
+      // One deadline for the whole range, resolved at its boundary: every piece, including work
+      // scheduled after the startup probe, refers to the same playback instant.
+      const deadline = deadlineOf(options);
       const parallel = options.parallel !== false;
       if (options.startup === true && parallel && typeof options.onOrderedChunk === "function") {
-        return downloadStartupMediaRange(range, resolver, options, settings);
+        return downloadStartupMediaRange(range, resolver, { ...options, deadline }, settings);
       }
       const preferredUrls = parallel && typeof resolver.rangeCandidates === "function"
         ? resolver.rangeCandidates()
@@ -677,8 +1136,8 @@
         ? Math.max(1, Math.trunc(Number(options.maxConcurrency)))
         : globalConcurrency;
       const effectiveConcurrency = parallel ? Math.min(globalConcurrency, requestedConcurrency) : 1;
-      // 后台预取可以限制自己的子块数，但不能降低全局信号量上限；
-      // 否则一个低优先级预取会把后续播放器的紧急请求也锁在低并发上。
+      // Fewer primary pieces than slots is not a hard-reserved connection: it gives a
+      // stalled piece's hedge/retry room to start immediately while the other primaries run.
       semaphore.setLimit(globalConcurrency);
       const basePriority = Number.isFinite(Number(options.priority)) ? Number(options.priority) : 50;
       const rescueReserve = parallel && effectiveConcurrency >= 8
@@ -694,6 +1153,7 @@
         parallel ? adaptiveMinChunk(settings, range.length, pieceConcurrency, preferredUrls.length) : Number.MAX_SAFE_INTEGER
       );
       const primaries = parallel ? assignPrimaries(preferredUrls, resolver, pieces.length) : [];
+      const earlyHedge = createEarlyHedge(rescueReserve);
       const progressive = typeof options.onOrderedChunk === "function";
       const ordered = new Array(pieces.length);
       let nextOrderedIndex = 0;
@@ -717,7 +1177,9 @@
           options.kind || "media",
           preferredFor(primaries[piece.index], preferredUrls),
           options.startup === true,
-          basePriority - Math.min(20, piece.index)
+          basePriority - Math.min(20, piece.index),
+          deadline,
+          earlyHedge
         );
         if (progressive) {
           ordered[piece.index] = result;
@@ -738,8 +1200,8 @@
       };
     }
 
-    return Object.freeze({ downloadRange, applySettings: () => semaphore.setLimit(config().concurrency) });
+    return Object.freeze({ downloadRange, applySettings, getConcurrency: () => semaphore.limit });
   }
 
-  root.__BILI_IDM_DOWNLOADER_FACTORY__ = Object.freeze({ createDownloader });
+  root.__BILI_IDM_DOWNLOADER_FACTORY__ = Object.freeze({ createDownloader, createAutoConcurrency, autoConcurrency });
 })(globalThis);

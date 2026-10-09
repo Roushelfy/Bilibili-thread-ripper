@@ -15,13 +15,18 @@ const mediaUrl=host=>`https://${host}/upgcxcode/00/00/1/1-1-30080.m4s?deadline=1
 const dead=Object.assign(new Error("Range 校验失败：HTTP 503"),{name:"Error"});
 const aborted=new DOMException("并发副本已取消","AbortError");
 
-test("new defaults: mainland CDN, 8 threads, error notices off",()=>{
+test("new defaults: mainland CDN, 8 threads, error notices off, live off, episodes on",()=>{
   const {core}=load();
   const defaults=core.normalizeSettings({});
   assert.equal(defaults.mode,"mainland");assert.equal(defaults.concurrency,8);assert.equal(defaults.errorNotices,false);assert.equal(defaults.debugNotices,false);
   const chosen=core.normalizeSettings({mode:"overseas",concurrency:32,errorNotices:true});
   assert.equal(chosen.mode,"overseas");assert.equal(chosen.concurrency,32);assert.equal(chosen.errorNotices,true);
   assert.equal(core.normalizeSettings({concurrency:7}).concurrency,8);
+  assert.equal(defaults.theme,"auto");
+  for(const theme of ["auto","light","dark"]) assert.equal(core.normalizeSettings({theme}).theme,theme);
+  for(const theme of ["invalid",null,{},1]) assert.equal(core.normalizeSettings({theme}).theme,"auto");
+  assert.equal(defaults.liveEnabled,false);assert.equal(core.normalizeSettings({liveEnabled:true}).liveEnabled,true);
+  assert.equal(defaults.episodeEnabled,true);assert.equal(core.normalizeSettings({episodeEnabled:false}).episodeEnabled,false);
 });
 
 test("a node is banned after two failures that delivered 0 bytes, and only for the current video",()=>{

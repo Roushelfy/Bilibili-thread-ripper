@@ -1,26 +1,28 @@
 // ==UserScript==
 // @name         Bilibili 线程撕裂者_测试
 // @namespace    https://github.com/Roushelfy/Bilibili-thread-ripper
-// @version      0.9.4.3
+// @version      2026.10.8.1
 // @description  保留哔哩哔哩原生播放器，通过多 CDN、多 Range 并发下载改善视频缓冲速度。
+// @icon         https://raw.githubusercontent.com/Roushelfy/Bilibili-thread-ripper/main/icons/icon-128.png
 // @author       MrTangLuyao
 // @license      MIT
 // @homepageURL  https://github.com/Roushelfy/Bilibili-thread-ripper
 // @supportURL   https://github.com/Roushelfy/Bilibili-thread-ripper/issues
 // @updateURL    https://raw.githubusercontent.com/Roushelfy/Bilibili-thread-ripper/main/user_scripts/bilibili-thread-ripper.user.js
 // @downloadURL  https://raw.githubusercontent.com/Roushelfy/Bilibili-thread-ripper/main/user_scripts/bilibili-thread-ripper.user.js
-// @match        https://www.bilibili.com/*
-// @match        https://m.bilibili.com/*
-// @match        https://live.bilibili.com/*
+// @match        https://*.bilibili.com/*
 // @run-at       document-start
 // @grant        GM_registerMenuCommand
 // @grant        GM_addElement
 // @grant        unsafeWindow
+// @grant        GM.getValue
+// @grant        GM.setValue
+// @grant        GM_addValueChangeListener
 // @sandbox      JavaScript
 // @inject-into  content
 // ==/UserScript==
 
-// 这个文件由 scripts/build-userscript.ps1 生成，不要直接修改。
+// 这个文件由 scripts/build.mjs 生成，不要直接修改。
 (function () {
 "use strict";
 
@@ -31,23 +33,31 @@ if (document.documentElement?.hasAttribute("data-btr-userscript")) return;
 document.documentElement?.setAttribute("data-btr-userscript", "");
 
 /* user_scripts/adapter/storage-shim.js */
-// Userscripts have no extension storage. This small stand-in keeps the parts of the
-// chrome.* API that bridge.js uses and saves settings in this site's localStorage.
-// Changes made in another bilibili tab arrive through the storage event.
+// This small stand-in keeps the parts of the chrome.* API that bridge.js uses: storage,
+// and runtime.lastError for its callbacks.
+//
+// The settings live in the script manager's storage, which every bilibili subdomain shares.
+// Only the manager's side of the script (loader.js) can reach it, so this page code asks it
+// with events. loader.js marks the page when it answers them; without that mark, or when it
+// does not answer, the settings stay in this site's localStorage as before, which is kept per
+// subdomain. Changes made in another tab arrive from the manager, or, where the manager does
+// not report them, are read again when this tab comes back into view.
+//
+// What the manager holds is also copied to this site's localStorage for fallback when the
+// manager is unavailable. Each manager keeps its own settings; an empty manager never
+// imports this copy.
 const chrome = (() => {
   const PREFIX = "BTR_Userscript.";
+  const AREAS = ["sync", "local"];
+  const mark = document.documentElement?.getAttribute("data-btr-userscript-storage") || "";
   const listeners = new Set();
   const parse = (text) => {
     try {
-      const value = JSON.parse(text || "{}");
+      const value = typeof text === "string" ? JSON.parse(text || "{}") : text;
       return value && typeof value === "object" && !Array.isArray(value) ? value : {};
     } catch (_error) {
       return {};
     }
-  };
-  const read = (area) => {
-    try { return parse(localStorage.getItem(PREFIX + area)); }
-    catch (_error) { return {}; }
   };
   const diff = (before, after) => {
     const changes = {};
@@ -63,52 +73,132 @@ const chrome = (() => {
       catch (error) { console.error("BTR settings listener", error); }
     }
   };
-  // No toolbar icon or background page: nothing sends messages here.
-  const runtime = {
-    lastError: null,
-    sendMessage: () => Promise.resolve(),
-    onMessage: { addListener() {} }
+
+  // This site's localStorage: the fallback, and what every version before 2026 used.
+  const localBackend = {
+    load: (area) => {
+      try { return Promise.resolve(parse(localStorage.getItem(PREFIX + area))); }
+      catch (_error) { return Promise.resolve({}); }
+    },
+    change: (area, op, value) => {
+      let next = {};
+      try { next = parse(localStorage.getItem(PREFIX + area)); } catch (_error) {}
+      if (op === "set") Object.assign(next, value);
+      else for (const key of value) delete next[key];
+      try { localStorage.setItem(PREFIX + area, JSON.stringify(next)); }
+      catch (error) { return Promise.reject(error); }
+      return Promise.resolve(next);
+    }
   };
+
+  // The manager's storage, through loader.js. Requests and answers are JSON text: objects
+  // would not cross Firefox's boundary between the page and the manager's sandbox.
+  let requestCount = 0;
+  const pending = new Map();
+  const managerBackend = {
+    request(message) {
+      return new Promise((resolve, reject) => {
+        const id = String(++requestCount);
+        pending.set(id, { resolve, reject });
+        document.dispatchEvent(new CustomEvent("btr-userscript-storage-request", { detail: JSON.stringify({ ...message, id }) }));
+      });
+    },
+    load(area) { return this.request({ op: "get", area }); },
+    change(area, op, value) { return this.request(op === "set" ? { op, area, items: value } : { op, area, keys: value }); }
+  };
+  document.addEventListener("btr-userscript-storage-reply", (event) => {
+    let reply = null;
+    try { reply = JSON.parse(event.detail); } catch (_error) { return; }
+    const entry = pending.get(String(reply?.id));
+    if (!entry) return;
+    pending.delete(String(reply.id));
+    if (reply.error) entry.reject(new Error(reply.error));
+    else entry.resolve(parse(reply.value));
+  });
+
+  const cache = {};
+  const loads = {};
+  let backend = mark ? managerBackend : localBackend;
+  const keepCopy = (area, value) => {
+    if (backend !== managerBackend) return;
+    try { localStorage.setItem(PREFIX + area, JSON.stringify(value)); } catch (_error) {}
+  };
+  // A manager that marked the page but never answers must not keep the settings from loading.
+  const load = (area) => {
+    loads[area] ||= (backend === managerBackend
+      ? Promise.race([backend.load(area), new Promise((_resolve, reject) => setTimeout(() => reject(new Error("no answer")), 3000))])
+        .catch(() => { backend = localBackend; return backend.load(area); })
+      : backend.load(area)).then((value) => { cache[area] = value; keepCopy(area, value); return value; });
+    return loads[area];
+  };
+  // What the storage now holds after a change, from this tab or from another one.
+  const settle = (area, value) => {
+    const before = cache[area] || {};
+    cache[area] = value;
+    keepCopy(area, value);
+    notify(diff(before, value), area);
+  };
+
+  const runtime = { lastError: null };
   // Callers either pass a callback and read runtime.lastError, or await the promise.
-  const finish = (value, callback, error = null) => {
-    if (typeof callback !== "function") return error ? Promise.reject(error) : Promise.resolve(value);
-    queueMicrotask(() => {
+  const finish = (promise, callback) => {
+    const done = promise.then((value) => [value, null], (error) => [undefined, error]);
+    if (typeof callback !== "function") return done.then(([value, error]) => (error ? Promise.reject(error) : value));
+    return done.then(([value, error]) => {
       runtime.lastError = error ? { message: String(error.message || error) } : null;
       try { callback(value); }
       finally { runtime.lastError = null; }
+      return value;
     });
-    return Promise.resolve(value);
   };
-  const write = (area, next) => {
-    const before = read(area);
-    try { localStorage.setItem(PREFIX + area, JSON.stringify(next)); }
-    catch (error) { return error; }
-    queueMicrotask(() => notify(diff(before, next), area));
-    return null;
-  };
+  // The change shows at once in this tab; the storage's own answer, which may also carry
+  // another tab's change, settles it.
+  const change = (area, op, value) => load(area).then((stored) => {
+    const next = { ...stored };
+    if (op === "set") Object.assign(next, value);
+    else for (const key of value) delete next[key];
+    settle(area, next);
+    return backend.change(area, op, value).then((result) => settle(area, result));
+  });
   const storageArea = (area) => ({
     get(keys, callback) {
-      const stored = read(area);
-      let value;
-      if (keys === null || keys === undefined) value = { ...stored };
-      else if (typeof keys === "string") value = keys in stored ? { [keys]: stored[keys] } : {};
-      else if (Array.isArray(keys)) value = Object.fromEntries(keys.filter((key) => key in stored).map((key) => [key, stored[key]]));
-      else value = Object.fromEntries(Object.keys(keys).map((key) => [key, key in stored ? stored[key] : keys[key]]));
-      return finish(value, callback);
+      return finish(load(area).then((stored) => {
+        if (keys === null || keys === undefined) return { ...stored };
+        if (typeof keys === "string") return keys in stored ? { [keys]: stored[keys] } : {};
+        if (Array.isArray(keys)) return Object.fromEntries(keys.filter((key) => key in stored).map((key) => [key, stored[key]]));
+        return Object.fromEntries(Object.keys(keys).map((key) => [key, key in stored ? stored[key] : keys[key]]));
+      }), callback);
     },
     set(items, callback) {
-      return finish(undefined, callback, write(area, { ...read(area), ...items }));
+      return finish(change(area, "set", { ...items }), callback);
     },
     remove(keys, callback) {
-      const next = read(area);
-      for (const key of [].concat(keys)) delete next[key];
-      return finish(undefined, callback, write(area, next));
+      return finish(change(area, "remove", [].concat(keys)), callback);
     }
   });
+
+  // Another tab changed something.
   addEventListener("storage", (event) => {
-    if (!event.key?.startsWith(PREFIX)) return;
-    notify(diff(parse(event.oldValue), parse(event.newValue)), event.key.slice(PREFIX.length));
+    if (backend !== localBackend || !event.key?.startsWith(PREFIX)) return;
+    const area = event.key.slice(PREFIX.length);
+    if (AREAS.includes(area) && cache[area]) settle(area, parse(event.newValue));
   });
+  document.addEventListener("btr-userscript-storage-change", (event) => {
+    let message = null;
+    try { message = JSON.parse(event.detail); } catch (_error) { return; }
+    if (backend === managerBackend && AREAS.includes(message?.area) && cache[message.area]) settle(message.area, parse(message.value));
+  });
+  // Managers that do not report other tabs' changes ("live" is missing from the mark): read
+  // the storage again whenever this tab comes back.
+  if (mark && !mark.split(" ").includes("live")) {
+    const refresh = () => {
+      if (document.visibilityState !== "visible" || backend !== managerBackend) return;
+      for (const area of AREAS) if (cache[area]) backend.load(area).then((value) => settle(area, value), () => {});
+    };
+    addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+  }
+
   return Object.freeze({
     runtime,
     storage: Object.freeze({
@@ -211,8 +301,13 @@ const chrome = (() => {
     const requested = Math.trunc(Number(source.concurrency));
     return {
       enabled: source.enabled !== false,
-      // The live module on live.bilibili.com; the master switch above still rules.
-      liveEnabled: source.liveEnabled !== false,
+      theme: ["light", "dark"].includes(source.theme) ? source.theme : "auto",
+      // The live module on live.bilibili.com; the master switch above still rules. Off unless
+      // switched on: a viewer who never chose keeps Bilibili's own live player.
+      liveEnabled: source.liveEnabled === true,
+      // 剧集加速: episode pages (/bangumi/play/ep… and ss…: anime, films, documentaries, …),
+      // sped up in the compatibility mode only.
+      episodeEnabled: source.episodeEnabled !== false,
       // "full" replaces Bilibili's playback core; "compat" leaves it in charge and only
       // downloads its media requests.
       takeover: source.takeover === "compat" ? "compat" : "full",
@@ -221,10 +316,20 @@ const chrome = (() => {
         .map(normalizeCdnHost)
         .filter((host, index, all) => host && all.indexOf(host) === index)
         .slice(0, 32),
+      // The round button in the page corner that opens the settings panel, and where the
+      // viewer dragged it: which side, and how far down as a share of the window height.
+      floatingButton: source.floatingButton !== false,
+      // Where the viewer dragged it, as shares of the window (0 = flush left, 1 = flush
+      // right); null when it was never moved.
+      floatingButtonLeft: source.floatingButtonLeft != null && Number(source.floatingButtonLeft) >= 0 && Number(source.floatingButtonLeft) <= 1 ? Number(source.floatingButtonLeft) : null,
+      floatingButtonTop: source.floatingButtonTop != null && Number(source.floatingButtonTop) >= 0 && Number(source.floatingButtonTop) <= 1 ? Number(source.floatingButtonTop) : null,
       debugNotices: source.debugNotices === true,
       errorNotices: source.errorNotices === true,
       debugCategories: Object.fromEntries(["takeover", "playback", "download", "buffer", "settings", "other"].map(key => [key, source.debugCategories?.[key] !== false])),
       concurrency: allowed.includes(requested) ? requested : 8,
+      // 自动线程数: the downloader picks the thread count itself, between 8 and 64, and
+      // `concurrency` above is only what the viewer set by hand. Off unless asked for.
+      autoConcurrency: source.autoConcurrency === true,
       minChunkBytes: 64 * 1024,
       firstByteTimeoutMs: 5500,
       stallTimeoutMs: 4000,
@@ -753,6 +858,19 @@ const chrome = (() => {
   const PIECE_RETRY_WINDOW_MS = 25000;
   // Below this a resumed request saves less than its own round trip costs.
   const RESUME_MIN_BYTES = 32 * 1024;
+  // Hedging a piece with a playback deadline (see hedgeDue): a first copy projected to finish
+  // this long before the deadline gets no copy yet; one receiving at least HEDGE_PACE of the
+  // usual connection speed is on pace; a copy's node measured HEDGE_FASTER times faster than the
+  // first copy is receiving is worth a copy anyway.
+  const HEDGE_SLACK_MS = 1500;
+  const HEDGE_PACE = 0.6;
+  const HEDGE_FASTER = 1.5;
+  // Queue classes, served in this order: the startup probe and init/index, then startup
+  // pieces, then everything else. A class never waits behind a lower one.
+  const QUEUE_CRITICAL = 0, QUEUE_STARTUP = 1, QUEUE_ORDINARY = 2;
+  // Priority an ordinary request with a playback deadline gains per millisecond of waiting:
+  // 20 (a hedge copy's boost) in 0.9 s.
+  const QUEUE_AGING_PER_MS = 20 / 900;
   // A shorter transfer is mostly round trip. The tail of a resumed piece can be a few KiB,
   // and counting it would mark down the very node that came to the rescue.
   const SPEED_SAMPLE_MIN_BYTES = 48 * 1024;
@@ -776,7 +894,34 @@ const chrome = (() => {
     }
 
     drain() {
+      try { this.drainQueue(); } finally { this.onChange?.(this.active, this.limit, this.queue.length); }
+    }
+
+    drainQueue() {
       while (this.active < this.limit && this.queue.length) {
+        const now = performance.now();
+        const urgency = entry => {
+          // Read again at every pass: the player's deadline moves with the playhead and the
+          // playback rate, and a queued piece may have become due while it waited.
+          const deadlineAt = entry.deadline ? entry.deadline() : entry.deadlineAt;
+          if (!Number.isFinite(deadlineAt)) return 0;
+          const remaining = deadlineAt - now;
+          if (remaining <= 0) return 12;
+          if (remaining <= 750) return 9;
+          if (remaining <= 2000) return 6;
+          return 0;
+        };
+        // A bounded, recomputed boost prevents overdue primaries from sitting behind
+        // prefetch work without turning the queue back into strict deadline ordering. A
+        // request with a deadline also gains priority while it waits, so a piece queued long
+        // ago is not passed over again and again by newer ones of a slightly higher priority;
+        // requests without one (compatibility mode, the desktop client) keep the fixed order.
+        // Sorting inside the class keeps the startup probe, init and index, and then the
+        // startup pieces, ahead of ordinary media whatever the boosts add up to.
+        const rank = entry => entry.priority + urgency(entry)
+          + (entry.ages ? (now - entry.queuedAt) * QUEUE_AGING_PER_MS : 0);
+        this.queue.sort((a, b) => a.queueClass - b.queueClass || rank(b) - rank(a)
+          || a.sequence - b.sequence);
         const entry = this.queue.shift();
         entry.signal?.removeEventListener("abort", entry.cancel);
         if (entry.signal?.aborted) {
@@ -793,7 +938,9 @@ const chrome = (() => {
       }
     }
 
-    acquire(signal, priority = 0) {
+    // deadline: a function giving the clock time playback needs this request, or null; the
+    // fixed deadlineAt is what callers without one pass.
+    acquire(signal, priority = 0, deadlineAt = Infinity, queueClass = QUEUE_CRITICAL, ages = false, deadline = null) {
       if (signal?.aborted) return Promise.reject(abortError(signal.reason));
       return new Promise((resolve, reject) => {
         const entry = {
@@ -802,6 +949,11 @@ const chrome = (() => {
           signal,
           released: false,
           priority: Number(priority) || 0,
+          deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : Infinity,
+          deadline,
+          queueClass,
+          ages,
+          queuedAt: performance.now(),
           sequence: this.sequence++
         };
         entry.cancel = () => {
@@ -813,11 +965,255 @@ const chrome = (() => {
         };
         signal?.addEventListener("abort", entry.cancel, { once: true });
         this.queue.push(entry);
-        this.queue.sort((a, b) => b.priority - a.priority || a.sequence - b.sequence);
         this.drain();
+        this.onChange?.(this.active, this.limit, this.queue.length);
       });
     }
   }
+
+  // 自动线程数. One controller for the whole page: the thread count starts at 8 and climbs a
+  // ladder towards 64 on every sign that the download is not keeping up with playback
+  // (the player stalls; a low buffer stops growing while bytes keep arriving; a
+  // connection waits too long for its first byte while every slot is busy). Every step up
+  // is a trial: ten seconds later the bytes per second must have grown, otherwise the
+  // step is taken back to where it started and that level rests for a while — more
+  // connections that bring nothing only add risk. A server refusing the load (412, 429)
+  // steps it back too, and nothing climbs past a refused level until it has rested. The
+  // level is kept across videos on the same page; a new page starts at 8 again.
+  //
+  // Each start (a new video, a seek outside the buffer) opens with at least 16 threads: the
+  // first seconds are when a slow node turns into a spinning wheel. Once the buffer is well
+  // ahead, the count steps back down to the level the page had before. A sign of not keeping
+  // up meanwhile climbs as usual and ends the start there; so does half a minute without
+  // catching up. From then on the rules above carry on.
+  const AUTO_LADDER = Object.freeze([8, 12, 16, 24, 32, 48, 64]);
+  const AUTO_STARTUP_LEVEL = 2;
+  const AUTO_STARTUP_COMFORT_SECONDS = 15;
+  const AUTO_STARTUP_MAX_MS = 30000;
+  const AUTO_STEP_COOLDOWN_MS = 2500;
+  const AUTO_TRIAL_MS = 10000;
+  const AUTO_WINDOW_MS = 5000;
+  const AUTO_BUCKET_MS = 250;
+  const AUTO_REST_MS = 90000;
+  const AUTO_PUSHBACK_REST_MS = 180000;
+  const AUTO_LOW_BUFFER_SECONDS = 6;
+  const AUTO_PRESSURE_MS = 1000;
+  const AUTO_ACTIVITY_MS = 1500;
+
+  function createAutoConcurrency({ now = () => performance.now() } = {}) {
+    const listeners = new Set();
+    const state = {
+      level: 0, changedAt: 0, reason: "起步", steps: 0, trial: null,
+      // level index -> { until, hard }: hard rests (refusals) also cap every level above.
+      resting: new Map(),
+      buckets: [], lastActivityAt: -Infinity,
+      // Time the connections spent saturated: intervals of { from, to } within the window.
+      saturated: false, saturatedSince: 0, saturatedSpans: [],
+      aheadSamples: [], pressureSince: 0,
+      // The start of a session while it runs above the page's own level: { base, until }.
+      startup: null
+    };
+    const threads = () => AUTO_LADDER[state.level];
+
+    function pruneBuckets(at) {
+      while (state.buckets.length && at - state.buckets[0].at > AUTO_WINDOW_MS) state.buckets.shift();
+    }
+
+    // Bytes per second over the window, from completed pieces only: a hedge copy that lost
+    // its race is not delivery.
+    function throughput(at = now()) {
+      pruneBuckets(at);
+      if (!state.buckets.length) return 0;
+      const bytes = state.buckets.reduce((sum, item) => sum + item.bytes, 0);
+      // Over the time between the first and the last delivery in the window: an idle tail
+      // (nothing wanted) is not slowness.
+      return bytes * 1000 / Math.max(1000, state.buckets.at(-1).at - state.buckets[0].at + AUTO_BUCKET_MS);
+    }
+
+    // The share of the window during which every slot was busy and pieces were queued.
+    function saturation(at = now()) {
+      const from = at - AUTO_WINDOW_MS;
+      state.saturatedSpans = state.saturatedSpans.filter((span) => span.to > from);
+      let busy = state.saturatedSpans.reduce((sum, span) => sum + Math.max(0, span.to - Math.max(span.from, from)), 0);
+      if (state.saturated) busy += Math.max(0, at - Math.max(state.saturatedSince, from));
+      return Math.min(1, busy / AUTO_WINDOW_MS);
+    }
+
+    function resting(level, at) {
+      const rest = state.resting.get(level);
+      if (!rest) return null;
+      if (rest.until <= at) { state.resting.delete(level); return null; }
+      return rest;
+    }
+
+    function setLevel(level, reason, trial) {
+      const previous = threads();
+      const at = now();
+      state.level = level;
+      state.changedAt = at;
+      state.reason = reason;
+      state.steps += 1;
+      state.trial = trial || null;
+      state.pressureSince = 0;
+      for (const listener of listeners) {
+        try { listener({ threads: threads(), previous, reason }); } catch (_error) {}
+      }
+    }
+
+    // Up one level. A level resting after a refusal caps the climb; one resting after a
+    // fruitless trial is skipped only by a strong signal (a stall), not by pressure.
+    function stepUp(reason, strong) {
+      const at = now();
+      if (at - state.changedAt < AUTO_STEP_COOLDOWN_MS) return false;
+      if (resting(state.level, at)?.hard) return false;
+      let next = state.level + 1;
+      while (next < AUTO_LADDER.length) {
+        const rest = resting(next, at);
+        if (!rest) break;
+        if (rest.hard || !strong) return false;
+        next += 1;
+      }
+      if (next >= AUTO_LADDER.length) return false;
+      setLevel(next, reason, { from: state.level, level: next, at, baseline: throughput(at), stalled: false });
+      // Not keeping up even with the start's threads: the start ends at this level.
+      state.startup = null;
+      return true;
+    }
+
+    // How high a start may go: up to 16 threads, but not onto or past a level the server
+    // refused (a fruitless trial does not hold it back; the start comes down on its own).
+    function startupLevel(at) {
+      if (resting(state.level, at)?.hard) return state.level;
+      let level = state.level;
+      while (level < AUTO_STARTUP_LEVEL && !resting(level + 1, at)?.hard) level += 1;
+      return level;
+    }
+
+    function stepDown(target, restLevel, reason, restMs, hard) {
+      state.resting.set(restLevel, { until: now() + restMs, hard });
+      if (target >= state.level) return false;
+      setLevel(target, reason, null);
+      return true;
+    }
+
+    // A step up has had its time: did the extra connections deliver? Only judged when the
+    // connections were busy meanwhile; an idle download (buffer full) proves nothing, and
+    // so does a stall in between. Without any gain the step goes back to where it started.
+    function judgeTrial(at) {
+      const trial = state.trial;
+      if (!trial || at - trial.at < AUTO_TRIAL_MS) return;
+      state.trial = null;
+      if (trial.stalled || saturation(at) < 0.6 || trial.baseline <= 0) return;
+      if (throughput(at) < trial.baseline) {
+        stepDown(trial.from, trial.level, `${AUTO_LADDER[trial.level]} 线程没有比 ${AUTO_LADDER[trial.from]} 线程更快`, AUTO_REST_MS, false);
+      }
+    }
+
+    return Object.freeze({
+      ladder: AUTO_LADDER,
+      threads,
+      subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+      // A piece arrived whole.
+      delivered(bytes, at = now()) {
+        const last = state.buckets.at(-1);
+        if (last && at - last.at < AUTO_BUCKET_MS) last.bytes += bytes;
+        else state.buckets.push({ at, bytes });
+        pruneBuckets(at);
+        judgeTrial(at);
+      },
+      // Bytes are flowing on some connection right now.
+      activity(at = now()) {
+        state.lastActivityAt = at;
+      },
+      // The connections' state whenever it changes.
+      demand(active, limit, queued, at = now()) {
+        const saturated = active >= limit && queued > 0;
+        if (saturated === state.saturated) return;
+        if (state.saturated) state.saturatedSpans.push({ from: state.saturatedSince, to: at });
+        state.saturated = saturated;
+        state.saturatedSince = at;
+        saturation(at);
+      },
+      // The player stalled: more threads at once.
+      stall(reason = "播放卡了一下") {
+        if (state.trial) state.trial.stalled = true;
+        return stepUp(reason, true);
+      },
+      // The buffer ahead of the playhead, a few times a second while playing. A low buffer
+      // that has not grown over the last second although bytes keep arriving, for a whole
+      // second, means the connections are too few.
+      buffer(ahead, playing, at = now()) {
+        state.aheadSamples.push({ at, ahead });
+        while (state.aheadSamples.length && at - state.aheadSamples[0].at > AUTO_PRESSURE_MS + AUTO_BUCKET_MS) state.aheadSamples.shift();
+        // The start: once well ahead, one step back down per cooldown towards the page's level.
+        const start = state.startup;
+        if (start && at >= start.until) state.startup = null;
+        else if (start && ahead >= AUTO_STARTUP_COMFORT_SECONDS && at - state.changedAt >= AUTO_STEP_COOLDOWN_MS) {
+          if (state.level > start.base) setLevel(state.level - 1, `开头已经跟上，线程数降到 ${AUTO_LADDER[state.level - 1]}`, null);
+          if (state.level <= start.base) state.startup = null;
+        }
+        const earlier = state.aheadSamples.find((item) => at - item.at >= AUTO_PRESSURE_MS);
+        const downloading = at - state.lastActivityAt < AUTO_ACTIVITY_MS;
+        const pressed = playing && downloading && ahead < AUTO_LOW_BUFFER_SECONDS && earlier && ahead <= earlier.ahead + 0.05;
+        if (!pressed) { state.pressureSince = 0; return false; }
+        if (!state.pressureSince) { state.pressureSince = at; return false; }
+        if (at - state.pressureSince < AUTO_PRESSURE_MS) return false;
+        state.pressureSince = 0;
+        return stepUp("缓冲跟不上播放", false);
+      },
+      // A connection waited too long for its first byte while every slot was busy.
+      slow() {
+        return saturation() >= 0.6 ? stepUp("连接排队等太久", false) : false;
+      },
+      // The server refused the load: back one level, and nothing climbs past this one for
+      // a while.
+      pushback(status) {
+        return stepDown(Math.max(0, state.level - 1), state.level, `服务器返回 ${status}`, AUTO_PUSHBACK_REST_MS, true);
+      },
+      // A new playback session: what the buffer did before means nothing now, and the start
+      // runs with more threads. A session that begins while another one's start is still
+      // running keeps the page's own level to come back to.
+      newSession() {
+        const at = now();
+        state.aheadSamples.length = 0;
+        state.pressureSince = 0;
+        state.trial = null;
+        state.buckets.length = 0;
+        state.saturatedSpans.length = 0;
+        if (state.saturated) state.saturatedSince = at;
+        const base = state.startup ? state.startup.base : state.level;
+        const target = startupLevel(at);
+        if (target > state.level) setLevel(target, `开头先用 ${AUTO_LADDER[target]} 线程`, null);
+        state.startup = state.level > base ? { base, until: at + AUTO_STARTUP_MAX_MS } : null;
+      },
+      status() {
+        const at = now();
+        return {
+          threads: threads(), level: state.level, reason: state.reason, steps: state.steps, changedAt: state.changedAt,
+          throughputBps: Math.round(throughput(at)), saturation: Math.round(saturation(at) * 100) / 100,
+          buckets: state.buckets.length, activityAgeMs: Math.round(at - state.lastActivityAt),
+          resting: [...state.resting.entries()].filter(([, rest]) => rest.until > at).map(([level, rest]) => ({ threads: AUTO_LADDER[level], hard: rest.hard, forMs: Math.round(rest.until - at) })),
+          trial: state.trial ? { from: AUTO_LADDER[state.trial.from], level: AUTO_LADDER[state.trial.level], ageMs: Math.round(at - state.trial.at), baselineBps: Math.round(state.trial.baseline), stalled: state.trial.stalled } : null,
+          startup: state.startup ? { base: AUTO_LADDER[state.startup.base], forMs: Math.round(state.startup.until - at) } : null
+        };
+      },
+      reset() {
+        state.level = 0; state.changedAt = 0; state.reason = "起步"; state.steps = 0; state.trial = null;
+        state.resting.clear(); state.buckets.length = 0; state.lastActivityAt = -Infinity;
+        state.saturated = false; state.saturatedSince = 0; state.saturatedSpans.length = 0;
+        state.aheadSamples.length = 0; state.pressureSince = 0; state.startup = null;
+      }
+    });
+  }
+  const autoConcurrency = createAutoConcurrency();
+  // Every downloader on the page follows the controller's count at once.
+  const autoFollowers = new Set();
+  autoConcurrency.subscribe(() => {
+    for (const ref of autoFollowers) {
+      const follow = ref.deref();
+      if (follow) follow(); else autoFollowers.delete(ref);
+    }
+  });
 
   function createDownloader(options) {
     const nativeFetch = options.nativeFetch || root.fetch.bind(root);
@@ -827,15 +1223,24 @@ const chrome = (() => {
     // tells whether the previous normalization is still valid.
     let rawSettings = null;
     let normalizedSettings = null;
+    let autoView = null;
     function config() {
       const raw = getSettings();
       if (raw !== rawSettings || !normalizedSettings) {
         rawSettings = raw;
         normalizedSettings = core.normalizeSettings(raw);
+        autoView = null;
       }
-      return normalizedSettings;
+      if (!normalizedSettings.autoConcurrency) return normalizedSettings;
+      // In the automatic mode the thread count is the controller's, everything else the viewer's.
+      const threads = autoConcurrency.threads();
+      if (!autoView || autoView.concurrency !== threads) autoView = { ...normalizedSettings, concurrency: threads };
+      return autoView;
     }
     const semaphore = new Semaphore(config().concurrency);
+    const applySettings = () => semaphore.setLimit(config().concurrency);
+    autoFollowers.add(new WeakRef(applySettings));
+    semaphore.onChange = (active, limit, queued) => { if (config().autoConcurrency) autoConcurrency.demand(active, limit, queued); };
 
     // What one connection typically delivers here and how long a sub-chunk typically
     // takes. Sub-chunk sizing and the hedge delay follow these measurements.
@@ -862,16 +1267,97 @@ const chrome = (() => {
     // A second copy starts once a piece takes clearly longer than pieces have been
     // taking, instead of always waiting the full fixed delay.
     function hedgeDelayMs(settings) {
-      if (!meter.pieceMs) return settings.hedgeDelayMs;
-      return Math.max(250, Math.min(settings.hedgeDelayMs, Math.round(meter.pieceMs * 1.5)));
+      return meter.pieceMs
+        ? Math.max(250, Math.min(settings.hedgeDelayMs, Math.round(meter.pieceMs * 1.5)))
+        : settings.hedgeDelayMs;
     }
 
-    async function readBody(response, controller, transferId, settings, received) {
+    // Whether the second copy of a piece with a playback deadline should start now. Checked
+    // every 50 ms once the first copy holds a connection (a copy of a request still queued
+    // would only queue as well, and with its higher priority take the connection meant for
+    // it). first: the first copy (when it started, bytes received, bytes asked for); the delay
+    // counts from its start. copyBps: the measured speed of the copy's node, 0 when unknown.
+    // - No data yet, or nothing new for a whole delay (stopped): copy.
+    // - A deadline it meets with time to spare at its speed so far: no copy yet, the bandwidth
+    //   goes to pieces needed sooner.
+    // - The copy's node known to be clearly faster: copy.
+    // - Slower than connections usually are: copy.
+    // - On pace: a copy on a node known to be no faster only takes the next piece's connection
+    //   and bandwidth; one on a node not measured yet is tried, as the chance of a faster one.
+    //   A piece that will miss its deadline even so may spend one of the range's rescue slots
+    //   on that node anyway: its measurement can be stale (a node that was slow a minute ago
+    //   may have recovered), and waiting for the request to time out costs far more.
+    function hedgeDue(first, delayMs, deadlineAt, copyBps, rescue) {
+      const now = performance.now(), ran = now - first.startedAt;
+      const got = first.recorder.bytes;
+      if (got !== first.seenBytes) {
+        first.seenBytes = got;
+        first.seenAt = now;
+      }
+      if (ran < delayMs) return false;
+      if (!got || now - first.seenAt >= delayMs) return true;
+      const rate = got * 1000 / ran;
+      if (now + Math.max(0, first.length - got) * 1000 / rate <= deadlineAt - HEDGE_SLACK_MS) return false;
+      if (copyBps > rate * HEDGE_FASTER) return true;
+      if (!(meter.connectionBps > 0) || rate < meter.connectionBps * HEDGE_PACE) return true;
+      if (!(copyBps > 0)) return true;
+      return now + Math.max(0, first.length - got) * 1000 / rate > deadlineAt
+        && Boolean(rescue?.claimStale?.());
+    }
+
+    // When playback needs a range, as a clock time; Infinity when the caller did not say.
+    // options.deadlineAt is that time, options.deadlineMs the time left; either can be a
+    // function, read again at every check, so a new playback rate or position also moves the
+    // deadline of pieces already on their way.
+    function deadlineOf(options) {
+      const read = (value, relative) => {
+        const ms = Number(value);
+        if (value == null || !Number.isFinite(ms)) return Infinity;
+        return relative ? performance.now() + Math.max(0, ms) : ms;
+      };
+      const live = (value, relative) => () => {
+        try { return read(value(), relative); } catch (_error) { return Infinity; }
+      };
+      if (typeof options.deadlineAt === "function") return live(options.deadlineAt, false);
+      if (options.deadlineAt != null && Number.isFinite(Number(options.deadlineAt))) {
+        const fixed = Number(options.deadlineAt);
+        return () => fixed;
+      }
+      if (typeof options.deadlineMs === "function") return live(options.deadlineMs, true);
+      const fixed = read(options.deadlineMs, true);
+      return () => fixed;
+    }
+
+    // Only measured per-request progress can spend this bounded rescue budget. The second
+    // budget is for pieces that will miss their deadline while their copy's node is measured
+    // as no faster: that measurement can be stale, and a bounded number of such copies per
+    // range is far cheaper than waiting for a timeout.
+    function createEarlyHedge(limit) {
+      return {
+        progressRemaining: Math.max(0, limit),
+        claimProgress() {
+          if (this.progressRemaining <= 0) return false;
+          this.progressRemaining -= 1;
+          return true;
+        },
+        // At least one per range, even where no connection is held back (a single-piece
+        // download): one request is much cheaper than waiting out a timeout.
+        staleRemaining: Math.max(1, limit),
+        claimStale() {
+          if (this.staleRemaining <= 0) return false;
+          this.staleRemaining -= 1;
+          return true;
+        }
+      };
+    }
+
+    async function readBody(response, controller, transferId, settings, received, report = onTransfer) {
       if (!response.body?.getReader) {
         const bytes = new Uint8Array(await response.arrayBuffer());
         received.bytes += bytes.byteLength;
         received.chunks?.push(bytes);
-        onTransfer({ phase: "progress", id: transferId, bytes: bytes.byteLength });
+        if (settings.autoConcurrency) autoConcurrency.activity();
+        report({ phase: "progress", id: transferId, bytes: bytes.byteLength });
         return bytes;
       }
       const reader = response.body.getReader();
@@ -901,7 +1387,8 @@ const chrome = (() => {
           // The recorder keeps what a failed attempt already received, so a retry or a
           // hedge copy can ask only for the missing tail.
           received.chunks?.push(chunk);
-          onTransfer({ phase: "progress", id: transferId, bytes: chunk.byteLength });
+          if (settings.autoConcurrency) autoConcurrency.activity();
+          report({ phase: "progress", id: transferId, bytes: chunk.byteLength });
         }
       } finally {
         clearTimeout(stallTimer);
@@ -920,9 +1407,12 @@ const chrome = (() => {
     // begin: called once the request has its connection slot, and returns what to ask for.
     // A copy that waited in the queue resumes from what the first copy has received by then,
     // not from what it had when the copy was queued.
-    async function attempt(piece, url, signal, kind, resolver, priority = 0, begin = null) {
+    async function attempt(piece, url, signal, kind, resolver, priority = 0, begin = null,
+      deadline = null, observeProgress = null, queueClass = QUEUE_CRITICAL) {
       const settings = config();
-      const release = await semaphore.acquire(signal, priority);
+      const deadlineAt = deadline ? deadline() : Infinity;
+      const release = await semaphore.acquire(signal, priority, deadlineAt, queueClass,
+        queueClass === QUEUE_ORDINARY && Number.isFinite(deadlineAt), deadline);
       let received = { bytes: 0, chunks: [] };
       if (begin) {
         try {
@@ -940,8 +1430,18 @@ const chrome = (() => {
       else signal?.addEventListener("abort", cancel, { once: true });
       const firstByteTimer = setTimeout(() => controller.abort(new DOMException("CDN 首字节超时", "TimeoutError")), settings.firstByteTimeoutMs);
       const totalTimer = setTimeout(() => controller.abort(new DOMException("CDN 子块总耗时超限", "TimeoutError")), settings.attemptTimeoutMs);
-      const transferId = onTransfer({ phase: "start", kind, totalBytes: piece.length, url });
       const startedAt = performance.now();
+      const report = event => {
+        const elapsedMs = Math.max(1, performance.now() - startedAt);
+        const bps = received.bytes * 1000 / elapsedMs;
+        const remaining = Math.max(0, piece.length - received.bytes);
+        const payload = { ...event, receivedBytes: received.bytes, totalBytes: piece.length,
+          bps, etaMs: bps > 0 ? Math.round(remaining * 1000 / bps) : null };
+        observeProgress?.({ ...payload, elapsedMs });
+        return onTransfer(payload);
+      };
+      const transferId = report({ phase: "start", kind, totalBytes: piece.length, url,
+        deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null });
       try {
         const response = await nativeFetch(url, {
           method: "GET",
@@ -960,13 +1460,13 @@ const chrome = (() => {
           // The status tells a refused signed address (4xx) apart from a node that is down.
           throw Object.assign(new Error(`Range 校验失败：HTTP ${response.status}`), { status: response.status });
         }
-        const bytes = await readBody(response, controller, transferId, settings, received);
+        const bytes = await readBody(response, controller, transferId, settings, received, report);
         if (bytes.byteLength !== piece.length) throw new Error(`子块长度不符：${bytes.byteLength}/${piece.length}`);
         const elapsedMs = Math.max(1, performance.now() - startedAt);
         recordMeter(bytes.byteLength, elapsedMs);
         // The node answered either way; only a large enough transfer says how fast it is.
         resolver.success(url, bytes.byteLength >= SPEED_SAMPLE_MIN_BYTES ? bytes.byteLength * 1000 / elapsedMs : 0);
-        onTransfer({ phase: "done", id: transferId });
+        report({ phase: "done", id: transferId });
         return { bytes, total: contentRange.total, url };
       } catch (error) {
         const canceled = error?.name === "AbortError";
@@ -979,7 +1479,11 @@ const chrome = (() => {
         }
         // Received bytes tell a dead node (0 KiB) apart from a transfer that stalled midway.
         resolver.failure(url, error, received.bytes);
-        onTransfer({ phase: canceled ? "cancel" : "error", id: transferId, error });
+        if (settings.autoConcurrency) {
+          if (error?.status === 412 || error?.status === 429) autoConcurrency.pushback(error.status);
+          else if (!canceled && error?.name === "TimeoutError" && received.bytes === 0) autoConcurrency.slow();
+        }
+        report({ phase: canceled ? "cancel" : "error", id: transferId, error });
         throw error;
       } finally {
         clearTimeout(firstByteTimer);
@@ -1039,7 +1543,10 @@ const chrome = (() => {
       return candidates;
     }
 
-    async function downloadPiece(piece, resolver, signal, kind, preferredUrls, startupMode = false, priority = 0) {
+    async function downloadPiece(piece, resolver, signal, kind, preferredUrls, startupMode = false, priority = 0,
+      deadline = null, earlyHedge = null) {
+      const hasDeadline = Boolean(deadline) && Number.isFinite(deadline());
+      const deadlineNow = () => (deadline ? deadline() : Infinity);
       const settings = config();
       const allowed = (url) => typeof resolver.allows !== "function" || resolver.allows(url);
       const startup = startupMode === true || startupMode === "probe";
@@ -1094,18 +1601,63 @@ const chrome = (() => {
           // for the rest of the hedge delay.
           let firstFailed = () => {};
           const firstFailure = new Promise((resolve) => { firstFailed = resolve; });
+          let firstStartedAt = 0, deadlineDeficitSamples = 0, firstBecameStraggler = () => {};
+          const firstStraggler = new Promise((resolve) => { firstBecameStraggler = resolve; });
+          const observeFirst = event => {
+            if (!hasDeadline || event.phase !== "progress" || !Number.isFinite(event.etaMs)) return;
+            const deadlineAt = deadlineNow();
+            const missesDeadline = Number.isFinite(deadlineAt)
+              && event.etaMs >= Math.max(0, deadlineAt - performance.now());
+            const slowerThanPeers = meter.connectionBps > 0 && event.bps < meter.connectionBps * 0.5
+              && event.etaMs >= 500;
+            const remainingToDeadline = deadlineAt - performance.now();
+            deadlineDeficitSamples = Number.isFinite(deadlineAt)
+              && event.etaMs - remainingToDeadline >= 250
+              ? deadlineDeficitSamples + 1
+              : 0;
+            // A clearly slow node is rescued immediately. If the whole route is slow,
+            // two consecutive deficit samples may spend the same one-per-range budget.
+            if (Number.isFinite(deadlineAt)
+              && ((missesDeadline && slowerThanPeers) || deadlineDeficitSamples >= 2)) {
+              firstBecameStraggler();
+            }
+          };
           const contexts = [];
           const attempts = pair.map((url, pairIndex) => (async () => {
             if (pairIndex) await new Promise((resolve, reject) => {
-              const delay = probe ? 0 : startup ? Math.min(250, settings.hedgeDelayMs) : hedgeDelayMs(settings);
-              const timer = setTimeout(resolve, delay);
-              firstFailure.then(() => {
-                clearTimeout(timer);
-                resolve();
+              let timer = null, settled = false, earlyClaimed = false;
+              const finish = (operation) => {
+                if (settled) return;
+                settled = true;
+                if (timer) clearTimeout(timer);
+                controllers[pairIndex].signal.removeEventListener("abort", canceled);
+                operation();
+              };
+              const measured = hedgeDelayMs(settings);
+              const delay = probe ? 0 : startup
+                ? Math.min(hasDeadline ? 200 : 250, measured)
+                : measured;
+              const copyBps = () => (typeof resolver.speed === "function" ? resolver.speed(url) || 0 : 0);
+              // A playback-deadline request decides once its first copy has a connection (see
+              // hedgeDue); one without a deadline (compatibility mode, the desktop client)
+              // keeps main's delay from the moment the piece asked, queue time included.
+              const check = () => {
+                if (settled) return;
+                if (contexts[0] && hedgeDue(contexts[0], delay, deadlineNow(), copyBps(), earlyHedge)) return finish(resolve);
+                timer = setTimeout(check, 50);
+              };
+              if (hasDeadline && !probe) timer = setTimeout(check, 0);
+              else timer = setTimeout(() => finish(resolve), delay);
+              firstStraggler.then(() => {
+                if (settled || probe || earlyClaimed || !earlyHedge?.claimProgress?.()) return;
+                earlyClaimed = true;
+                if (timer) clearTimeout(timer);
+                const grace = Math.max(0, 250 - (performance.now() - firstStartedAt));
+                timer = setTimeout(() => finish(resolve), grace);
               });
+              firstFailure.then(() => finish(resolve));
               const canceled = () => {
-                clearTimeout(timer);
-                reject(abortError(controllers[pairIndex].signal.reason));
+                finish(() => reject(abortError(controllers[pairIndex].signal.reason)));
               };
               if (controllers[pairIndex].signal.aborted) canceled();
               else controllers[pairIndex].signal.addEventListener("abort", canceled, { once: true });
@@ -1115,13 +1667,15 @@ const chrome = (() => {
             let base = null;
             const recorder = { bytes: 0, chunks: [] };
             const begin = () => {
+              if (!pairIndex) firstStartedAt = performance.now();
               base = prefix && prefix.bytes >= RESUME_MIN_BYTES ? prefix : null;
               if (pairIndex) {
                 const live = liveProgress(contexts[0]);
                 if (live && live.bytes >= RESUME_MIN_BYTES && live.bytes > (base?.bytes || 0)) base = live;
               }
               if (base && base.bytes >= piece.length) base = null;
-              contexts[pairIndex] = { base, recorder };
+              const startedAt = performance.now();
+              contexts[pairIndex] = { base, recorder, startedAt, seenBytes: 0, seenAt: startedAt, length: piece.length - (base?.bytes || 0) };
               return {
                 recorder,
                 part: base
@@ -1130,7 +1684,9 @@ const chrome = (() => {
               };
             };
             try {
-              const result = await attempt(piece, url, controllers[pairIndex].signal, kind, resolver, priority + (pairIndex ? 20 : 0), begin);
+              const result = await attempt(piece, url, controllers[pairIndex].signal, kind, resolver,
+                priority + (pairIndex ? 20 : 0), begin, deadline, pairIndex ? null : observeFirst,
+                probe ? QUEUE_CRITICAL : startup ? QUEUE_STARTUP : QUEUE_ORDINARY);
               return base
                 ? { bytes: core.concatChunks([...base.chunks, result.bytes], piece.length), total: result.total, url: result.url }
                 : result;
@@ -1145,6 +1701,7 @@ const chrome = (() => {
             controllers.forEach((controller) => {
               if (!controller.signal.aborted) controller.abort(new DOMException("并发副本已取消", "AbortError"));
             });
+            if (settings.autoConcurrency) autoConcurrency.delivered(piece.length);
             return winner;
           } catch (aggregate) {
             lastError = aggregate?.errors?.at?.(-1) || aggregate;
@@ -1329,7 +1886,8 @@ const chrome = (() => {
         options.kind || "media",
         candidateUrls,
         "probe",
-        220
+        220,
+        options.deadline
       );
       await options.onOrderedChunk(headResult.bytes, head, headResult.total);
       if (head.end >= range.end) {
@@ -1378,6 +1936,7 @@ const chrome = (() => {
       const measured = typeof resolver.speed === "function" ? (url) => resolver.speed(url) > 0 : () => false;
       const provenUrls = candidateUrls.filter((url) => url === headResult.url || measured(url));
       const primaries = assignPrimaries(provenUrls.length ? provenUrls : [headResult.url], resolver, pieces.length);
+      const earlyHedge = createEarlyHedge(rescueReserve);
       const pendingPieces = pieces.map(async (piece, orderedIndex) => {
         const result = await downloadPiece(
           piece,
@@ -1386,7 +1945,9 @@ const chrome = (() => {
           options.kind || "media",
           preferredFor(primaries[orderedIndex], [headResult.url, ...candidateUrls.filter((url) => url !== headResult.url)]),
           true,
-          120 - Math.min(30, piece.index)
+          120 - Math.min(30, piece.index),
+          options.deadline,
+          earlyHedge
         );
         ordered[orderedIndex] = result;
         await flushOrdered();
@@ -1410,9 +1971,12 @@ const chrome = (() => {
     async function downloadRange(range, resolver, options = {}) {
       const settings = config();
       if (options.kind === "meta") return downloadStartupRange(range, resolver, options);
+      // One deadline for the whole range, resolved at its boundary: every piece, including work
+      // scheduled after the startup probe, refers to the same playback instant.
+      const deadline = deadlineOf(options);
       const parallel = options.parallel !== false;
       if (options.startup === true && parallel && typeof options.onOrderedChunk === "function") {
-        return downloadStartupMediaRange(range, resolver, options, settings);
+        return downloadStartupMediaRange(range, resolver, { ...options, deadline }, settings);
       }
       const preferredUrls = parallel && typeof resolver.rangeCandidates === "function"
         ? resolver.rangeCandidates()
@@ -1422,8 +1986,8 @@ const chrome = (() => {
         ? Math.max(1, Math.trunc(Number(options.maxConcurrency)))
         : globalConcurrency;
       const effectiveConcurrency = parallel ? Math.min(globalConcurrency, requestedConcurrency) : 1;
-      // 后台预取可以限制自己的子块数，但不能降低全局信号量上限；
-      // 否则一个低优先级预取会把后续播放器的紧急请求也锁在低并发上。
+      // Fewer primary pieces than slots is not a hard-reserved connection: it gives a
+      // stalled piece's hedge/retry room to start immediately while the other primaries run.
       semaphore.setLimit(globalConcurrency);
       const basePriority = Number.isFinite(Number(options.priority)) ? Number(options.priority) : 50;
       const rescueReserve = parallel && effectiveConcurrency >= 8
@@ -1439,6 +2003,7 @@ const chrome = (() => {
         parallel ? adaptiveMinChunk(settings, range.length, pieceConcurrency, preferredUrls.length) : Number.MAX_SAFE_INTEGER
       );
       const primaries = parallel ? assignPrimaries(preferredUrls, resolver, pieces.length) : [];
+      const earlyHedge = createEarlyHedge(rescueReserve);
       const progressive = typeof options.onOrderedChunk === "function";
       const ordered = new Array(pieces.length);
       let nextOrderedIndex = 0;
@@ -1462,7 +2027,9 @@ const chrome = (() => {
           options.kind || "media",
           preferredFor(primaries[piece.index], preferredUrls),
           options.startup === true,
-          basePriority - Math.min(20, piece.index)
+          basePriority - Math.min(20, piece.index),
+          deadline,
+          earlyHedge
         );
         if (progressive) {
           ordered[piece.index] = result;
@@ -1483,10 +2050,10 @@ const chrome = (() => {
       };
     }
 
-    return Object.freeze({ downloadRange, applySettings: () => semaphore.setLimit(config().concurrency) });
+    return Object.freeze({ downloadRange, applySettings, getConcurrency: () => semaphore.limit });
   }
 
-  root.__BILI_IDM_DOWNLOADER_FACTORY__ = Object.freeze({ createDownloader });
+  root.__BILI_IDM_DOWNLOADER_FACTORY__ = Object.freeze({ createDownloader, createAutoConcurrency, autoConcurrency });
 })(globalThis);
 
 /* src/native-mse-player.js */
@@ -1509,6 +2076,23 @@ const chrome = (() => {
   const QUOTA_FATAL_AHEAD_SECONDS = 10;
   // A video whose buffer stays full through this many waits is given up after all.
   const QUOTA_MAX_WAITS = 8;
+
+  function playbackDeadlineAt(segmentStart, currentTime, playbackRate, now = performance.now()) {
+    const rate = Math.max(0.25, Math.abs(Number(playbackRate) || 1));
+    return now + Math.max(0, (Number(segmentStart) - Number(currentTime)) * 1000 / rate);
+  }
+
+  // Bilibili's core keeps the position it saved when it last reloaded its own source (a
+  // quality switch, or the retry it makes once BTR replaced the source) and seeks back to
+  // it every time the element reports new metadata, until the video ends or the page
+  // moves on. Every BTR session starts with new metadata, so after one such reload every
+  // drag of the progress bar and every quality switch ended up back at that old position.
+  // The moment of its last reload is known here, so its seek can be told from a viewer's
+  // and undone. Kept across players: the retake after a fallback is a new player.
+  let nativeRestore = { key: "", time: 0 };
+  function rememberNativeRestore(key, time) {
+    if (Number(time) >= 1) nativeRestore = { key, time: Number(time) };
+  }
   const QUALITY_NAMES = Object.freeze({
     127: "8K", 126: "杜比视界", 125: "HDR", 120: "4K", 116: "1080P 60帧",
     112: "1080P 高码率", 80: "1080P", 74: "720P 60帧", 64: "720P",
@@ -1549,6 +2133,13 @@ const chrome = (() => {
     return ["av1", "hevc", "avc"].includes(value) ? value : "";
   }
 
+  // The audio picked in the player: 0 the ordinary track, 1 杜比全景声, 2 Hi-Res 无损
+  // (Bilibili's own numbering, the newA of player.getQuality()).
+  function normalizeAudio(value) {
+    const audio = Math.trunc(Number(value)) || 0;
+    return audio === 1 || audio === 2 ? audio : 0;
+  }
+
   // "默认" in the player's 播放策略 menu keeps AV1 > HEVC > AVC. A codec picked there comes
   // first; a quality that does not have it falls back to that order.
   function codecPriority(representation, preferredCodec = "") {
@@ -1578,8 +2169,8 @@ const chrome = (() => {
 
   // preferredQuality is the quality chosen in the native menu; 0 is "auto" and keeps the
   // quality the playinfo itself asks for. preferredCodec is the codec chosen there, "" for
-  // "默认".
-  function selectRepresentations(playinfo, preferredQuality = 0, preferredCodec = "") {
+  // "默认". preferredAudio is the audio chosen there (see normalizeAudio).
+  function selectRepresentations(playinfo, preferredQuality = 0, preferredCodec = "", preferredAudio = 0) {
     const body = dashBody(playinfo);
     const dash = body?.dash;
     if (!dash) throw new Error("页面没有 DASH 播放清单");
@@ -1598,10 +2189,12 @@ const chrome = (() => {
       (Number(b.bandwidth) || 0) - (Number(a.bandwidth) || 0));
     // Dolby and Hi-Res sources keep their tracks in dash.dolby.audio / dash.flac.audio;
     // some of them have nothing in dash.audio at all, which used to fail the takeover.
-    // Ordinary tracks stay preferred, like the native player's default.
+    // The track picked in the player comes first when this browser can play it; otherwise
+    // the ordinary track, like the native player's default.
     const audioOf = (list) => [].concat(list || []).filter((item) => supported(item, "audio"))
       .sort((a, b) => (Number(b.bandwidth) || 0) - (Number(a.bandwidth) || 0))[0];
-    const audio = audioOf(dash.audio) || audioOf(dash.flac?.audio) || audioOf(dash.dolby?.audio);
+    const picked = { 1: dash.dolby?.audio, 2: dash.flac?.audio }[normalizeAudio(preferredAudio)];
+    const audio = audioOf(picked) || audioOf(dash.audio) || audioOf(dash.flac?.audio) || audioOf(dash.dolby?.audio);
     if (!videos.length || !audio) throw new Error("浏览器不支持清单中的视频或音频编码");
     const requestedQuality = Number(body?.quality || body?.qn) || 0;
     const preferred = [Number(preferredQuality) || 0, requestedQuality]
@@ -1698,6 +2291,7 @@ const chrome = (() => {
   // the page's error reporting. While a takeover is active, such a read answers with an
   // empty range instead; without one the browser behaves as before.
   let bufferedShimInstalled = false;
+  const ownSourceBuffers = new WeakSet();
   function installBufferedShim() {
     if (bufferedShimInstalled || !root.SourceBuffer) return;
     const descriptor = Object.getOwnPropertyDescriptor(root.SourceBuffer.prototype, "buffered");
@@ -1714,7 +2308,7 @@ const chrome = (() => {
         try {
           return descriptor.get.call(this);
         } catch (error) {
-          if (error?.name === "InvalidStateError" && document.querySelector('[data-btr-mse-active="true"]')) return emptyRanges;
+          if (error?.name === "InvalidStateError" && !ownSourceBuffers.has(this) && document.querySelector('[data-btr-mse-active="true"]')) return emptyRanges;
           throw error;
         }
       }
@@ -1736,13 +2330,102 @@ const chrome = (() => {
     leftoverGuardInstalled = true;
     root.addEventListener("error", (event) => {
       if (!NATIVE_LEFTOVER_RE.test(String(event.message || ""))) return;
-      if (!/hdslb\.com\/.*player/i.test(String(event.filename || ""))) return;
+      let source = null;
+      try { source = new URL(String(event.filename || "")); } catch (_error) { return; }
+      if (!/(^|\.)hdslb\.com$/i.test(source.hostname) || !/\/player\//i.test(source.pathname)) return;
       if (!document.querySelector('[data-btr-mse-active="true"]')) return;
       nativeLeftovers.suppressed += 1;
       nativeLeftovers.last = String(event.message || "").slice(0, 120);
       event.preventDefault();
       event.stopImmediatePropagation();
     }, true);
+  }
+
+  // Bilibili's player attaches its own MediaSource to the element and creates its source
+  // buffers a moment after it opens. A takeover that replaced the element's source in
+  // between closed that MediaSource under it, so its addSourceBuffer threw, and Bilibili took
+  // that for "this browser cannot play the codec" (#29): it stopped using HEVC in the whole
+  // tab, so 杜比视界 and HDR vanished from the quality menu, it stopped offering Hi-Res and
+  // Dolby audio on the page, and it restarted at a lower quality. The page's MediaSources
+  // are remembered by their object URL, and a takeover waits while the element holds one
+  // that is open without its buffers.
+  const pageMediaSources = new Map();
+  const ownMediaSources = new WeakSet();
+  const NATIVE_SOURCE_WAIT_MS = 1000;
+  let mediaSourceWatchInstalled = false;
+  function installMediaSourceWatch() {
+    if (mediaSourceWatchInstalled || typeof root.URL?.createObjectURL !== "function") return;
+    mediaSourceWatchInstalled = true;
+    const createObjectURL = root.URL.createObjectURL;
+    root.URL.createObjectURL = function (object) {
+      const url = createObjectURL.apply(this, arguments);
+      if (object instanceof root.MediaSource) {
+        pageMediaSources.set(url, object);
+        if (pageMediaSources.size > 16) pageMediaSources.delete(pageMediaSources.keys().next().value);
+      }
+      return url;
+    };
+  }
+
+  // Resolves once Bilibili's MediaSource on the element has its buffers, has closed, or after
+  // a second at most. null when there is nothing to wait for.
+  function nativeSourceSettled(video) {
+    const source = (video.srcObject instanceof root.MediaSource ? video.srcObject : null)
+      || pageMediaSources.get(video.src) || pageMediaSources.get(video.currentSrc);
+    if (!source || ownMediaSources.has(source) || source.readyState !== "open" || source.sourceBuffers.length >= 2) return null;
+    return new Promise((resolve) => {
+      let grace = null;
+      const done = () => {
+        clearTimeout(limit);
+        clearTimeout(grace);
+        source.sourceBuffers.removeEventListener("addsourcebuffer", added);
+        source.removeEventListener("sourceclose", done);
+        source.removeEventListener("sourceended", done);
+        resolve();
+      };
+      // Video and audio are added one right after the other; a source with a single track
+      // only costs the short grace period.
+      const added = () => {
+        if (source.sourceBuffers.length >= 2) done();
+        else if (!grace) grace = setTimeout(done, 150);
+      };
+      const limit = setTimeout(done, NATIVE_SOURCE_WAIT_MS);
+      source.sourceBuffers.addEventListener("addsourcebuffer", added);
+      source.addEventListener("sourceclose", done);
+      source.addEventListener("sourceended", done);
+    });
+  }
+
+  // Should Bilibili still record a codec failure while BTR plays, the failure is about BTR's
+  // takeover and not about the browser, yet it would keep HEVC and the Hi-Res / Dolby tracks
+  // off for the rest of the tab (sessionStorage) or, when its server asks for it, for days
+  // (localStorage). While a takeover is active those records are not written.
+  const CODEC_FAILURE_KEYS = new Set(["enableHEVCError", "enableAV1Error", "decodeHEVCError", "decodeAV1Error", "bilibili_decode_error_obj"]);
+  const codecFailures = { blocked: 0, last: "" };
+  let codecFailureGuardInstalled = false;
+  function installCodecFailureGuard() {
+    const storage = root.Storage?.prototype;
+    if (codecFailureGuardInstalled || typeof storage?.setItem !== "function") return;
+    codecFailureGuardInstalled = true;
+    const setItem = storage.setItem;
+    storage.setItem = function (key, value) {
+      if (CODEC_FAILURE_KEYS.has(String(key)) && document.querySelector('[data-btr-mse-active="true"]')) {
+        codecFailures.blocked += 1;
+        codecFailures.last = String(key);
+        return;
+      }
+      return setItem.apply(this, arguments);
+    };
+    // Versions up to 0.9.4.2 could leave such records behind; they are cleared once.
+    try {
+      if (root.localStorage.getItem("BTR.codecFailuresCleared") !== "1") {
+        for (const key of CODEC_FAILURE_KEYS) {
+          root.localStorage.removeItem(key);
+          root.sessionStorage.removeItem(key);
+        }
+        setItem.call(root.localStorage, "BTR.codecFailuresCleared", "1");
+      }
+    } catch (_error) {}
   }
 
   function createNativePlayer(options) {
@@ -1752,19 +2435,24 @@ const chrome = (() => {
     let currentPlayinfo = options.playinfo;
     let preferredQuality = Math.max(0, Math.trunc(Number(options.preferredQuality)) || 0);
     let preferredCodec = normalizeCodec(options.preferredCodec);
-    let selection = selectRepresentations(currentPlayinfo, preferredQuality, preferredCodec);
+    const preferredAudio = normalizeAudio(options.preferredAudio);
+    let selection = selectRepresentations(currentPlayinfo, preferredQuality, preferredCodec, preferredAudio);
     let selectedVideo = selection.preferred;
     // The two representation objects the running session downloads from. Its resolvers keep
     // reading them, so fresh addresses always go into these two and never into a newer
     // selection's copies.
     let selectedAudio = selection.audio;
     let sessionStarts = 0;
+    let sessionRequests = 0;
     let session = null;
     let destroyed = false;
     let generationSequence = 0;
     let seekTimer = null;
     let seekReloads = 0;
     let seekRequestedAt = 0;
+    let nativeRestoresUndone = 0;
+    const restoreKey = options.identity?.key || representationPath(selection.preferred) || "";
+    if (nativeRestore.key !== restoreKey) nativeRestore = { key: restoreKey, time: 0 };
     let seekStartedAt = 0;
     let seekSettledAt = 0;
     let lastSeekMs = 0;
@@ -1785,6 +2473,7 @@ const chrome = (() => {
       if (destroyed || !candidate || candidate.disposed || video.src === candidate.objectUrl) return;
       if (candidate.externalSourceDetected) return;
       candidate.externalSourceDetected = true;
+      rememberNativeRestore(restoreKey, video.currentTime);
       candidate.controller.abort(new DOMException("B站原生播放器正在切换媒体源", "AbortError"));
       clearInterval(candidate.timer);
       clearTimeout(candidate.endRetryTimer);
@@ -1946,12 +2635,18 @@ const chrome = (() => {
     }
 
     function segmentDownload(candidate, track, segment, index, downloadOptions = {}) {
+      // Read again at every check of the downloader: a new playback rate, or the playhead
+      // standing still during a stall, moves the deadline of pieces already on their way.
+      const deadlineAt = Number.isFinite(Number(downloadOptions.deadlineAt))
+        ? Number(downloadOptions.deadlineAt)
+        : () => playbackDeadlineAt(segment.startTime, Number(video.currentTime) || candidate.startTime, video.playbackRate);
       return downloader.downloadRange(segment, track.resolver, {
         signal: generationSignal(candidate),
         parallel: true,
         kind: track.kind,
         priority: downloadOptions.priority,
         hurry: downloadOptions.hurry === true,
+        deadlineAt,
         startup: downloadOptions.startup === true,
         onStartupScheduled: downloadOptions.onStartupScheduled,
         onOrderedChunk: downloadOptions.onOrderedChunk || null
@@ -1987,7 +2682,10 @@ const chrome = (() => {
         const index = track.startupIndex + 1;
         track.followupScheduled = true;
         const segment = track.sidx.segments[index];
-        if (segment) track.prefetches.set(index, segmentDownload(candidate, track, segment, index, { priority: 70, hurry: true }));
+        if (segment) track.prefetches.set(index, segmentDownload(candidate, track, segment, index, {
+          priority: 70,
+          hurry: true
+        }));
       }
       ensureBuffer(candidate);
     }
@@ -2062,10 +2760,12 @@ const chrome = (() => {
           if (!settled.result.streamed) {
             try {
               await append(candidate, track, settled.result.bytes, generation);
+              if (!sessionIsCurrent(candidate) || generation !== candidate.generation || signal.aborted) break;
               track.held = null;
             } catch (error) {
               // With this little buffered there is nothing left to give up, and waiting
               // would only stall the video: that stays a failure, as it always was.
+              if (!sessionIsCurrent(candidate) || generation !== candidate.generation || signal.aborted) break;
               if (!error?.bufferFull || error.aheadSeconds < QUOTA_FATAL_AHEAD_SECONDS) throw error;
               candidate.quotaWaits += 1;
               if (candidate.quotaWaits > QUOTA_MAX_WAITS) throw error;
@@ -2073,6 +2773,7 @@ const chrome = (() => {
               break;
             }
           }
+          if (!sessionIsCurrent(candidate) || generation !== candidate.generation || signal.aborted) break;
           if (!track.startupComplete && settled.index === track.startupIndex) {
             note("first segment in", `${track.kind} ${Math.round(settled.result.byteLength / 1024)} KiB in ${settled.result.pieceCount} pieces`);
             track.startupComplete = true;
@@ -2096,7 +2797,12 @@ const chrome = (() => {
       if (!candidate || !sessionIsCurrent(candidate) || candidate.fatal || candidate.streamEnded || candidate.ending) return;
       if (!candidate.tracks.length || !candidate.tracks.every((track) => track.complete)) return;
       candidate.ending = true;
+      const generation = candidate.generation;
+      // A seek inside the session opens a new generation whose tracks are not complete: an
+      // end prepared by the old one is dropped.
+      const stillWanted = () => generation === candidate.generation && candidate.tracks.every((track) => track.complete);
       Promise.all(candidate.tracks.map((track) => track.operation.catch(() => {}))).then(() => {
+        if (!stillWanted()) return;
         if (!sessionIsCurrent(candidate) || candidate.fatal || candidate.streamEnded || candidate.mediaSource.readyState !== "open") return;
         if (candidate.tracks.some((track) => track.sourceBuffer.updating)) {
           candidate.ending = false;
@@ -2111,6 +2817,7 @@ const chrome = (() => {
         candidate.streamEnded = true;
         publishState();
       }).catch((error) => {
+        if (!stillWanted()) return;
         candidate.ending = false;
         if (sessionIsCurrent(candidate) && error?.name !== "InvalidStateError") fatal(candidate, error);
         else if (sessionIsCurrent(candidate)) {
@@ -2251,7 +2958,18 @@ const chrome = (() => {
     }
 
     async function startSession(representation, playbackState) {
+
+      downloaderFactory.autoConcurrency?.newSession();
       if (destroyed) return;
+      const request = ++sessionRequests;
+      const settling = nativeSourceSettled(video);
+      if (settling) {
+        const waitedFrom = performance.now();
+        await settling;
+        note("waited for Bilibili's source buffers", `${Math.round(performance.now() - waitedFrom)} ms`);
+        // A later start replaced this one meanwhile.
+        if (destroyed || request !== sessionRequests) return;
+      }
       options.onLog?.("正在准备播放器", `使用 ${qualityLabel(representation)} 清晰度，从 ${Number(playbackState.time || 0).toFixed(2)} 秒开始。`, "info", "takeover");
       const previous = session;
       // Read once: selection can be replaced by a new playinfo while this session starts.
@@ -2261,6 +2979,7 @@ const chrome = (() => {
       sessionStarts += 1;
       note("session", `${qualityLabel(representation)} ${codecFamily(representation)} from ${Number(playbackState.time || 0).toFixed(1)}`);
       const mediaSource = new MediaSource();
+      ownMediaSources.add(mediaSource);
       const objectUrl = URL.createObjectURL(mediaSource);
       const candidate = {
         disposed: false, fatal: false, externalSourceDetected: false, generation: 0,
@@ -2276,7 +2995,7 @@ const chrome = (() => {
         volume: playbackState.volume, muted: playbackState.muted, playbackRate: playbackState.playbackRate,
         startTime: Math.max(0, Number(playbackState.time) || 0),
         forceStartTime: Boolean(playbackState.forceTime),
-        internalSeekTarget: null,
+        internalSeekTarget: null, metadataAt: 0, restoreUndoneAt: 0,
         // One ban list per video, shared by every quality and by the audio track.
         videoResolver: resolverFactory.createResolver(representation, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts),
         audioResolver: resolverFactory.createResolver(audio, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts)
@@ -2298,6 +3017,8 @@ const chrome = (() => {
         if (!sessionIsCurrent(candidate)) return;
         const videoBuffer = mediaSource.addSourceBuffer(mimeFor(representation, "video"));
         const audioBuffer = mediaSource.addSourceBuffer(mimeFor(audio, "audio"));
+        ownSourceBuffers.add(videoBuffer);
+        ownSourceBuffers.add(audioBuffer);
         const [videoTrack, audioTrack] = await Promise.all([
           loadTrack(candidate, "video", representation, candidate.videoResolver, videoBuffer, candidate.startTime),
           loadTrack(candidate, "audio", audio, candidate.audioResolver, audioBuffer, candidate.startTime)
@@ -2337,6 +3058,8 @@ const chrome = (() => {
     async function seekWithinSession(candidate, target) {
       const previousGeneration = candidate.generationController;
       openGeneration(candidate);
+      // 自动线程数 judges the buffer ahead of the playhead: the new position starts that watch afresh.
+      downloaderFactory.autoConcurrency?.newSession();
       // The segments of the position left behind are no longer wanted.
       previousGeneration?.abort(new DOMException("已经跳到新的位置", "AbortError"));
       candidate.startTime = target;
@@ -2345,6 +3068,11 @@ const chrome = (() => {
       clearTimeout(candidate.endRetryTimer);
       candidate.quotaWaits = 0;
       for (const track of candidate.tracks) {
+        // Queued, so it runs after whatever write is in progress and before the new
+        // position's first one: the parser forgets any half-written segment.
+        queuedSourceOperation(candidate, track, async () => {
+          if (candidate.mediaSource.readyState === "open") track.sourceBuffer.abort();
+        }).catch(() => {});
         track.prefetches.clear();
         track.held = null;
         track.complete = false;
@@ -2408,6 +3136,21 @@ const chrome = (() => {
     }
 
     function scheduleSeek() {
+      const candidate = session;
+      const target = Number(video.currentTime) || 0;
+      if (candidate && sessionIsCurrent(candidate) && !candidate.playbackActivated && candidate.metadataAt
+        && performance.now() - candidate.metadataAt < 250 && candidate.restoreUndoneAt !== candidate.metadataAt
+        && nativeRestore.time && Math.abs(target - nativeRestore.time) < 1 && Math.abs(target - candidate.startTime) >= 0.5) {
+        // The core restores once per metadata; a second seek to that position is the viewer's.
+        candidate.restoreUndoneAt = candidate.metadataAt;
+        nativeRestoresUndone += 1;
+        note("native restore undone", `${target.toFixed(1)} -> ${candidate.startTime.toFixed(1)}`);
+        options.onLog?.("挡住了 B 站播放器的回跳", `B 站的播放内核想跳回 ${target.toFixed(1)} 秒，保持在你选的 ${candidate.startTime.toFixed(1)} 秒。`, "info", "buffer");
+        setCurrentTimeInternal(candidate, candidate.startTime);
+        // Its restore also plays or pauses as things were back then; the viewer's intent wins.
+        if (!candidate.resumeWanted && !video.paused) video.pause();
+        return;
+      }
       seekRequestedAt = performance.now();
       clearTimeout(seekTimer);
       seekTimer = setTimeout(() => {
@@ -2416,13 +3159,24 @@ const chrome = (() => {
       }, 140);
     }
 
+    video.addEventListener("loadedmetadata", () => { if (session) session.metadataAt = performance.now(); }, { signal: eventController.signal });
     video.addEventListener("seeking", scheduleSeek, { signal: eventController.signal });
-    video.addEventListener("timeupdate", () => ensureBuffer(), { signal: eventController.signal });
+    video.addEventListener("timeupdate", () => {
+      ensureBuffer();
+      // 自动线程数 watches the buffer ahead of the playhead while playing.
+      const candidate = session;
+      if (candidate && sessionIsCurrent(candidate) && candidate.playbackActivated && candidate.tracks.length && core.normalizeSettings(getSettings()).autoConcurrency) {
+        const current = Number(video.currentTime) || 0;
+        const ahead = Math.max(0, Math.min(...candidate.tracks.map((track) => bufferedEndAt(track.sourceBuffer, current))) - current);
+        downloaderFactory.autoConcurrency?.buffer(ahead, !video.paused && !video.seeking);
+      }
+    }, { signal: eventController.signal });
     video.addEventListener("waiting", () => {
       const candidate = session;
       note("waiting", candidate?.playbackActivated ? "after start" : "before start");
       if (candidate && sessionIsCurrent(candidate) && candidate.playbackActivated) {
         candidate.startupWaitingEvents += 1;
+        if (!video.seeking && !video.paused && core.normalizeSettings(getSettings()).autoConcurrency) downloaderFactory.autoConcurrency?.stall("播放卡了一下");
         if (seekSettledAt && performance.now() - seekSettledAt < 15000 && !video.seeking) stallsAfterSeek += 1;
         if (performance.now() - candidate.playbackActivatedAt <= STARTUP_PROTECTION_MS && !candidate.recovering && !video.seeking) {
           candidate.recovering = true;
@@ -2473,7 +3227,7 @@ const chrome = (() => {
     function namesOlderAddresses(playinfo) {
       const listed = (item) => {
         const dash = dashBody(item)?.dash;
-        return [...(dash?.video || []), ...(dash?.audio || [])];
+        return [...(dash?.video || []), ...(dash?.audio || []), ...[].concat(dash?.dolby?.audio || [], dash?.flac?.audio || [])];
       };
       const known = [...listed(currentPlayinfo), selectedVideo, selectedAudio].filter(Boolean);
       return listed(playinfo).some((item) => {
@@ -2505,7 +3259,7 @@ const chrome = (() => {
 
     async function updatePlayinfo(playinfo) {
       if (destroyed) return;
-      const next = selectRepresentations(playinfo, preferredQuality, preferredCodec);
+      const next = selectRepresentations(playinfo, preferredQuality, preferredCodec, preferredAudio);
       // Bilibili's page and the timed refresh both bring playinfos, and the one that arrives
       // last is not always the newer one. An older one is dropped whole: kept as the current
       // playinfo it would hand its addresses to the next session, after a seek or a quality
@@ -2553,6 +3307,8 @@ const chrome = (() => {
       delete video.dataset.btrMediaEngine;
       delete options.container.dataset.btrMseActive;
       if (resumeNative && original.src) {
+        // Bilibili's core reloads from here and remembers this position (see nativeRestore).
+        rememberNativeRestore(restoreKey, state.time || original.currentTime);
         video.src = original.src;
         video.volume = original.volume;
         video.muted = original.muted;
@@ -2608,12 +3364,14 @@ const chrome = (() => {
       urlDeadlineSeconds,
       video,
       getDebug: () => ({
-        version: "0.9.4.3",
+        version: "2026.10.8.1",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,
         preferredQuality,
         preferredCodec,
+        preferredAudio,
+        codecFailuresBlocked: codecFailures.blocked,
         sessionStarts,
         codec: codecFamily(selectedVideo),
         width: Number(selectedVideo?.width) || 0,
@@ -2637,6 +3395,7 @@ const chrome = (() => {
         lastNativeLeftover: nativeLeftovers.last,
         progressiveAppends: session?.progressiveAppends || 0,
         seekReloads,
+        nativeRestoresUndone,
         lastSeekMs: Math.round(lastSeekMs),
         stallsAfterSeek,
         timeline: timeline.slice(),
@@ -2647,7 +3406,9 @@ const chrome = (() => {
 
   installBufferedShim();
   installNativeErrorGuard();
-  root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = Object.freeze({ createNativePlayer, qualityLabel, selectRepresentations });
+  installMediaSourceWatch();
+  installCodecFailureGuard();
+  root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = Object.freeze({ createNativePlayer, playbackDeadlineAt, qualityLabel, selectRepresentations });
 })(globalThis);
 
 /* src/native-range-transport.js */
@@ -3386,10 +4147,10 @@ const chrome = (() => {
 })(globalThis);
 
 /* src/settings-panel.js */
-// The settings panel of both the extension and the userscript. It runs in the bilibili page
-// and opens from the extension's toolbar icon, the userscript manager's menu, or "自定义" in
-// the player's gear menu. Settings are read and saved through bridge.js, which keeps them in
-// the extension's storage (in the userscript, in localStorage).
+// The settings panel. It runs in the bilibili page and opens from the button in the page's
+// corner, the userscript manager's menu, or "自定义" in the player's gear menu. Settings are
+// read and saved through bridge.js; storage-shim.js keeps them in the script manager's
+// storage.
 (function installSettingsPanel(root) {
   "use strict";
 
@@ -3401,16 +4162,32 @@ const chrome = (() => {
   const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
   const HOST_ID = "__bilibili_thread_ripper_settings__";
   const DIALOG_ID = "__bilibili_thread_ripper_settings_dialog__";
+  const LAUNCHER_ID = "__bilibili_thread_ripper_launcher__";
   const THREAD_OPTIONS = [4, 8, 16, 32, 64, 128];
   const MAX_CUSTOM_HOSTS = 32;
   const HOST_GROUPS = [["大陆节点", cdn.MAINLAND_HOSTS], ["海外节点", cdn.OVERSEAS_HOSTS]];
+  const PROJECT_URL = "https://github.com/MrTangLuyao/Bilibili-thread-ripper";
+  // GitHub's mark.
+  const GITHUB_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>`;
+  // The script's own icon, icons/icon-128.png (dev/userscript-test.js checks the two stay the same).
+  const ICON_URI = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAACXBIWXMAAAsTAAALEwEAmpwYAAAHzklEQVR4nO2d248VNRjA58HLuySi0UcV/xoDMZHoEw8Gjcil3WVFjUIUb1FcNhC23x7kohFwTbyh4opGAVHuKBBhXcALBCTrgnAWzp6208909pAYg7LrtNPOnO+XfG9sOPN9v2k7baeTJARBEARBEARBEARBEAThEuxceZtm8JDi0CM5DCguhiSD85KDVBywHUNykDYHWS6ynECP5r0P2lxVwj6cs2KKZDBPcdgbOtmlCyb2SC7m2hwmZQO7+u5UTCyXHC4HT2TJQzIxqjh0I+u9I4kdnA03Sg7zJYd66MRVLaS9mRgswbk9NycxMjZ/1TTF4fvQiap+iINjvO+eJCYUg/vprofiWgMmLinWNyOJgSbvmyUZqPB3RnuF5ELLBeLRoMWXDB4JnYh2D8nF3IDNvtChE9DuIcdrML3Q4jdY7S7J4WLoi6eAlgRQH+NwbyHFx8X9N9FoH+KTj8EB+xjuXQDJYVHwi6XAa3cH0Om1+HY2qjUzRUXgcXYFuABu9yaAnd4NfZEUcL2uYJm/hR2a28fYBbQttJcFpNaqXvALpIAJdAVijnMBaEkXyiTfbqfFtwMLyYWJ4MIo+IRaAIPzalOdCdDayUPJ5+XJgeZipjMB7Fal0BdEAZPNQbczAVr71agIvDw5kEx86kwAxeFE6AuigEnmQAw5E0ByMUIFgFJJKBkMuxOAiWboC6KAyQnAYcyZAJR8KKWAJEAERVAkQPhEtGskVesCCqfRRLwyhubcBTQnzqI5MITpZ/tQv7kV9dINwfNBAoTmz1E0ewdRrxlA9cQbwQtOLUBIGk1Mtx9G/dKm4IW/GtQFhCA1mO4ZRPX82yRA6ccAeWgqTD/ejaqjj1qAthSghfnxV1RPraUuoF0FsJhTw6ieXkdjgHYVwGJ+PYdqUbFPCjQIjAxz4DgJ0K4twFX0W19QC9DOAuCfo4V1BeG6gIU1TLfsRXNmBPF8fUJh/639G/u3lRYAEdP3dlZbgPSzvRMu/D/D/q0vAa7727tWo3pmPeqX30G9biumXxxE8/sFdI1dW1AdFRZgMnf+tVqCYALwa4de/n62GOQS/eq7JEBZBFA2OgDTT3YjGif1H58lrGoLUNougE/g2gb2ORHAfH+iugLEOgh0ktiFNTRnR/ILcPZ8hQXwFFEIwAHT93fm/i1Yb5AAZRVAv9KfXwClSYCyCqCeXJNfgKYiAUorwFNr3cwIeu4yaQwQcRdgTg+TAGVtAdIPvs39W9JdR0mAUgqw0M1jYNq/jQQoowCpi4kgY1A993aFxgD/Y+KndBNBHe6mgs3gae/FL1SAPFO/ZZgK1j1uF4P0us+rJUCeOz+qxaCu1aieXY/6FX/LwdnewAKWgkmAGDEG9YoPCyk+dQERkn6+v7DiFypAWQaBITHHTqHqrFVUgIKirJiTZ7P1g6LzRQJEgDl0MkjxSYDQ6BTTzbsKG/GTABFhBk9nC0ahu0zqAkIJcGoY9YavUHWGezWcBIgAc+4CaviEBHBldFkxdgfwM+upBWhXASxm5FLh5weFGwNEui08OPUrqLvfq74Asb4YEgVXxlC/uKnaAsT6bmAsGPtyaAHnBpEAEWP2/VRdAagLmAAGUa/8sJoCxDoInPDv71qNaslb2WyeXr8V022HnGwEvebpYR1VFMBT5CXv/69XfpQt67pEr9pMApRFAHV1c+i727N3+1xg9g+RAKUSgLdag3Vbsy1e+X+U9vZEQF2ARwGUHex+edBNN+BpvYAE8CyAsi+J1hu5BbAvm5AAJesC1NVWYMeR3L/LHP2NBCirALq2Jb8A/zH7SV1A7AIs3RDtWQE0BihAALXojWiPiyEBihDgSQfHxZAAE0t2lF3ACxvzCzDq58QwagHKMgj84yIJUNYWIP3mSLTnBVALUJaJoB1H4hYgls/H5yXWqeB009dxfz5ecjESuvixCaDXDGQfiXSBj49MSgbDzgRQDI6HLn5ll4PP+JkFVFwMORNAchgIXfyqbghJP/jWS64kE586E0Bx6GkrAbqK2RKGUvn8oGS3MwE0732wCgLERvrlQW+50gv6HnAmAM6rTZVcGBLAIfUr3nYC2VrZmiUuUUzsIQHcYZ8i/OVTfJe4RnIxlwRwQ7rjsNeuUjJ4zLkAOGfFFMnEKI0B8mGO/PKf7z7kL74YtbVKfGBHliRAzq1f9gnD492vOLyW+AJZ7x0hW4Eyk9rvA3i881t3/yXsXHlb4hPJxBMkwCRoNDHd+FUhN4hk0JH4BmfDjYrBAWoBroNBND+cLOS7AK3Yb2uTFEGD1e6SHC5SF/AvhR88lR0xX1R+JIf62PxV05IiUaxvhuRCFylB1NQb2bq+PWq+yJy0anBfEgLZIWa3rQCpyV7vtusE2Ru+Ac4EtDN+TQ4PJyFp8r5ZkoGqnACNZnaejz3dy/z8O5rDP2fFTvu3jx/sEOj837/f+ZLBI0kMKA7T7SNIyIS0U8jx8VeYZv/fGFvYe3eop4M2i/12EJ7ECC5efIPkMJ9aA/Bx119WDJbg4v6bktjBBXC7YuL10GsHVQhpc8hgmfcZPh+MLyDB44rBrhj2E5QlZJYr8Z3kYg6y2i1JFcCOVbdqLmbaBSXJYYvicMzuNo5ly7kKUWgmmq0d18daOem2ObK5Cl0vgiAIgiAIgiAIgiAIomL8Bc0CR4+jT4wjAAAAAElFTkSuQmCC";
+  // The theme button shows the choice in use: a sun for 浅色, a moon for 深色, and for 自动 a
+  // half sun, half moon with a small A in the corner.
+  const THEME_ICONS = `<svg class="icon-light" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"></path></svg>`
+    + `<svg class="icon-dark" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M20.5 13.8A8.5 8.5 0 1 1 10.2 3.5a6.6 6.6 0 0 0 10.3 10.3z"></path></svg>`
+    + `<svg class="icon-auto" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="4"></circle><path d="M10 6a4 4 0 0 1 0 8z" fill="currentColor" stroke="none"></path><path d="M10 1.7v1.8M10 16.5v1.8M1.7 10h1.8M16.5 10h1.8M4.1 4.1l1.3 1.3M15.9 4.1l-1.3 1.3M4.1 15.9l1.3-1.3"></path><path d="M14.6 22.8l4.1-9 4.1 9M16 19.6h5.4"></path></svg>`;
+  const THEME_LABELS = { auto: "自动（跟随系统）", light: "浅色", dark: "深色" };
   const KNOWN_HOSTS = HOST_GROUPS.flatMap(([, hosts]) => hosts);
 
   const PANEL_HTML = `
     <main>
       <header>
-        <div class="logo" aria-hidden="true">B</div>
-        <h1>线程撕裂者</h1>
+        <img class="logo" src="${ICON_URI}" alt="" width="42" height="42">
+        <div class="title">
+          <h1>线程撕裂者</h1>
+          <a id="github-link" class="github-link" href="${PROJECT_URL}" target="_blank" rel="noopener noreferrer" title="在 GitHub 上查看项目" aria-label="在 GitHub 上查看项目">${GITHUB_ICON}</a>
+          <button id="theme" class="theme-toggle" type="button" data-value="auto">${THEME_ICONS}</button>
+        </div>
         <label class="switch" title="启用或停用">
           <input id="enabled" type="checkbox">
           <span></span>
@@ -3443,12 +4220,16 @@ const chrome = (() => {
         <label><input type="radio" name="takeover" value="full"><span>全接管</span></label>
         <label><input type="radio" name="takeover" value="compat"><span>兼容模式</span></label>
       </section>
-      <p class="takeover-note">Safari 用户建议使用兼容模式。<br>全接管：视频由插件自己来放，什么时候下、下多少都由插件安排，效果最好。<br>兼容模式：还是 B 站自己的播放器在放，插件只帮它多线程下载，换清晰度这些都交给 B 站，更不容易出问题。</p>
+      <p class="takeover-note">Safari 用户建议使用兼容模式。<br>全接管：视频由插件自己来放，下载和缓冲都由插件安排，速度最快。<br>兼容模式：当遇到播放问题或设置不生效时，尝试使用兼容模式。</p>
 
       <section class="controls">
         <div class="control-title">
           <label for="concurrency">线程加载数</label>
           <output id="thread-value" for="concurrency">8</output>
+        </div>
+        <div class="auto-row">
+          <label for="auto-concurrency">自动线程数（推荐）<small>BTR将智能选择需要的线程数。</small></label>
+          <label class="switch"><input id="auto-concurrency" type="checkbox" aria-label="自动线程数"><span></span></label>
         </div>
         <div class="slider">
           <div id="slider-fill" class="slider-fill" aria-hidden="true"></div>
@@ -3459,10 +4240,21 @@ const chrome = (() => {
         </div>
       </section>
 
+      <section class="accel-controls" aria-label="加速范围">
+        <div class="accel-row">
+          <label for="episode-enabled">剧集加速<small>加速番剧、电影、纪录片等剧集，使用兼容模式。</small></label>
+          <label class="switch"><input id="episode-enabled" type="checkbox" aria-label="剧集加速"><span></span></label>
+        </div>
+        <div class="accel-row">
+          <label for="live-enabled">直播加速（实验性）</label>
+          <label class="switch"><input id="live-enabled" type="checkbox" aria-label="直播加速（实验性）"><span></span></label>
+        </div>
+      </section>
+
       <section class="notice-controls" aria-label="提示设置">
-        <div class="notice-row"><label for="live-enabled">直播加速</label><label class="switch"><input id="live-enabled" type="checkbox" aria-label="直播加速"><span></span></label></div>
         <div class="notice-row"><label for="error-notices">显示错误</label><label class="switch"><input id="error-notices" type="checkbox" aria-label="显示错误"><span></span></label></div>
         <div class="notice-row"><label for="debug-notices">Debug 模式</label><label class="switch"><input id="debug-notices" type="checkbox" aria-label="Debug 模式"><span></span></label></div>
+        <div class="notice-row"><label for="floating-button">悬浮按钮</label><label class="switch"><input id="floating-button" type="checkbox" aria-label="悬浮按钮"><span></span></label></div>
         <fieldset id="debug-filters" class="debug-filters" hidden>
           <legend>显示哪些 Debug 消息</legend>
           <div class="debug-filter-actions"><button id="debug-select-all" type="button">全选</button><button id="debug-select-none" type="button">全不选</button></div>
@@ -3474,6 +4266,12 @@ const chrome = (() => {
             <label><input type="checkbox" data-debug-category="settings">设置变化</label>
             <label><input type="checkbox" data-debug-category="other">其他日志</label>
           </div>
+          <div class="debug-copy">
+            <button id="debug-copy" type="button">复制诊断信息</button>
+            <span id="debug-copy-status" class="debug-copy-status" role="status"></span>
+          </div>
+          <p class="debug-copy-note">反馈问题时点一下，把复制下来的内容贴到 issue 里。里面没有 Cookie、账号信息和视频的下载地址。</p>
+          <textarea id="debug-copy-text" class="debug-copy-text" readonly hidden aria-label="诊断信息"></textarea>
         </fieldset>
       </section>
 
@@ -3484,88 +4282,171 @@ const chrome = (() => {
     </main>`;
 
   const PANEL_CSS = `
+    .btr-popup {
+      --scheme: dark; --bg: #17191f; --surface: #20232a; --hover: #292d35;
+      --border: #30343d; --divider: #343943; --control-border: #444b57;
+      --text: #f5f7fb; --label: #c9ced9; --button-text: #d9dee8;
+      --muted: #949baa; --subtle: #8a93a6; --switch: #313a4c; --track: #3a3e47;
+      --error: #f28b85; --success: #9fd9a8; --focus: #fff;
+    }
+    .btr-popup[data-theme="light"] {
+      --scheme: light; --bg: #fff; --surface: #f4f5f8; --hover: #e8ebf0;
+      --border: #d6dae2; --divider: #d6dae2; --control-border: #aeb6c4;
+      --text: #202532; --label: #363f50; --button-text: #363f50;
+      --muted: #596579; --subtle: #596579; --switch: #758197; --track: #d6dae2;
+      --error: #b42318; --success: #227536; --focus: #244e9b;
+    }
     * { box-sizing: border-box; }
     .btr-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, .35); }
-    .btr-popup { position: fixed; top: 72px; right: 24px; width: 320px; max-width: calc(100vw - 32px); max-height: calc(100vh - 96px); overflow: auto; border: 1px solid #30343d; border-radius: 12px; box-shadow: 0 12px 40px rgba(0, 0, 0, .45); color-scheme: dark; font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; background: #17191f; color: #f5f7fb; font-size: 14px; line-height: normal; text-align: left; }
+    .btr-popup { position: fixed; top: 72px; right: 24px; width: 320px; max-width: calc(100vw - 32px); max-height: calc(100vh - 96px); overflow: auto; border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 12px 40px rgba(0, 0, 0, .45); color-scheme: var(--scheme); font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; line-height: normal; text-align: left; user-select: none; -webkit-user-select: none; }
+    input, textarea { user-select: text; -webkit-user-select: text; }
     main { padding: 18px 16px; }
     header { display: grid; grid-template-columns: 42px 1fr auto; align-items: center; gap: 11px; margin-bottom: 22px; }
-    .logo { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 8px; color: #fff; font-size: 23px; font-weight: 800; background: #fb7299; }
+    .logo { display: block; width: 42px; height: 42px; }
     h1 { margin: 0; font-size: 17px; letter-spacing: .2px; }
+    .title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .github-link, .theme-toggle { display: grid; flex: none; place-items: center; width: 26px; height: 26px; border-radius: 6px; color: var(--muted); transition: color 160ms ease, background 160ms ease; }
+    .github-link:hover, .theme-toggle:hover { color: var(--text); background: var(--hover); }
+    .github-link:focus-visible, .theme-toggle:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+    .github-link svg, .theme-toggle svg { width: 18px; height: 18px; }
+    .theme-toggle { margin-left: -6px; padding: 0; border: 0; background: transparent; cursor: pointer; }
+    .theme-toggle svg { display: none; }
+    .theme-toggle[data-value="auto"] .icon-auto, .theme-toggle[data-value="light"] .icon-light, .theme-toggle[data-value="dark"] .icon-dark { display: block; }
     .switch { position: relative; width: 42px; height: 24px; }
     .switch input { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
-    .switch span { position: absolute; inset: 0; border-radius: 999px; background: #313a4c; cursor: pointer; transition: 160ms ease; }
+    .switch span { position: absolute; inset: 0; border-radius: 999px; background: var(--switch); cursor: pointer; transition: 160ms ease; }
     .switch span::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: 160ms ease; }
     .switch input:checked + span { background: #fb7299; }
     .switch input:checked + span::after { transform: translateX(18px); }
-    .switch input:focus-visible + span { outline: 2px solid #fff; outline-offset: 3px; }
-    .mode-select { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; margin-bottom: 12px; overflow: hidden; border: 1px solid #30343d; border-radius: 8px; background: #30343d; }
+    .switch input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 3px; }
+    .mode-select { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; margin-bottom: 12px; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--border); }
     .mode-select label { position: relative; }
     .mode-select input { position: absolute; opacity: 0; }
-    .mode-select span { display: block; padding: 10px 6px; color: #949baa; background: #20232a; font-size: 12px; text-align: center; cursor: pointer; }
+    .mode-select span { display: block; padding: 10px 6px; color: var(--muted); background: var(--surface); font-size: 12px; text-align: center; cursor: pointer; }
     .mode-select input:checked + span { color: #fff; background: #fb7299; }
-    .mode-select input:focus-visible + span { outline: 2px solid #fff; outline-offset: -3px; }
-    .takeover-select { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; margin-bottom: 8px; overflow: hidden; border: 1px solid #30343d; border-radius: 8px; background: #30343d; }
+    .mode-select input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: -3px; }
+    .takeover-select { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; margin-bottom: 8px; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--border); }
     .takeover-select label { position: relative; }
     .takeover-select input { position: absolute; opacity: 0; }
-    .takeover-select span { display: block; padding: 10px 6px; color: #949baa; background: #20232a; font-size: 12px; text-align: center; cursor: pointer; }
+    .takeover-select span { display: block; padding: 10px 6px; color: var(--muted); background: var(--surface); font-size: 12px; text-align: center; cursor: pointer; }
     .takeover-select input:checked + span { color: #fff; background: #fb7299; }
-    .takeover-select input:focus-visible + span { outline: 2px solid #fff; outline-offset: -3px; }
-    .takeover-note { margin: 0 0 12px; padding: 0 2px; color: #7f8797; font-size: 11px; line-height: 1.6; }
-    .custom-hosts { margin-bottom: 12px; padding: 14px 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; }
+    .takeover-select input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: -3px; }
+    .takeover-note { margin: 0 0 12px; padding: 0 2px; color: var(--subtle); font-size: 11px; line-height: 1.6; }
+    .custom-hosts { margin-bottom: 12px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
     .custom-hosts[hidden] { display: none; }
-    .custom-head { display: flex; align-items: center; justify-content: space-between; color: #c9ced9; font-size: 13px; }
+    .custom-head { display: flex; align-items: center; justify-content: space-between; color: var(--label); font-size: 13px; }
     .custom-head b { min-width: 28px; padding: 2px 8px; border-radius: 5px; background: #fb7299; color: #fff; font-size: 12px; text-align: center; }
-    .custom-note { margin: 8px 0 0; color: #7f8797; font-size: 11px; line-height: 1.6; }
+    .custom-note { margin: 8px 0 0; color: var(--subtle); font-size: 11px; line-height: 1.6; }
     .custom-note[hidden] { display: none; }
-    .host-group { min-width: 0; margin: 12px 0 0; padding: 10px 0 0; border: 0; border-top: 1px solid #343943; }
-    .host-group legend { padding: 0 0 4px; color: #c9ced9; font-size: 12px; }
-    .host-option { display: flex; align-items: center; gap: 7px; margin-top: 7px; color: #c9ced9; font-size: 11px; overflow-wrap: anywhere; cursor: pointer; }
+    .host-group { min-width: 0; margin: 12px 0 0; padding: 10px 0 0; border: 0; border-top: 1px solid var(--divider); }
+    .host-group legend { padding: 0 0 4px; color: var(--label); font-size: 12px; }
+    .host-option { display: flex; align-items: center; gap: 7px; margin-top: 7px; color: var(--label); font-size: 11px; overflow-wrap: anywhere; cursor: pointer; }
     .host-option input { flex: none; width: 14px; height: 14px; margin: 0; accent-color: #fb7299; cursor: pointer; }
-    .manual-host { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 7px; color: #c9ced9; font-size: 11px; overflow-wrap: anywhere; }
-    .manual-host button { flex: none; width: 22px; height: 22px; padding: 0; border: 1px solid #444b57; border-radius: 4px; background: #292d35; color: #d9dee8; font: inherit; line-height: 20px; cursor: pointer; }
+    .manual-host { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 7px; color: var(--label); font-size: 11px; overflow-wrap: anywhere; }
+    .manual-host button { flex: none; width: 22px; height: 22px; padding: 0; border: 1px solid var(--control-border); border-radius: 4px; background: var(--hover); color: var(--button-text); font: inherit; line-height: 20px; cursor: pointer; }
     .host-form { display: flex; gap: 6px; margin-top: 10px; }
-    .host-form input { flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid #444b57; border-radius: 5px; background: #17191f; color: #f5f7fb; font: inherit; font-size: 12px; }
+    .host-form input { flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid var(--control-border); border-radius: 5px; background: var(--bg); color: var(--text); font: inherit; font-size: 12px; }
     .host-form button { flex: none; padding: 6px 10px; border: 0; border-radius: 5px; background: #fb7299; color: #fff; font: inherit; font-size: 12px; cursor: pointer; }
-    .host-error { min-height: 0; margin: 6px 0 0; color: #f28b85; font-size: 11px; }
+    .host-error { min-height: 0; margin: 6px 0 0; color: var(--error); font-size: 11px; }
     .host-error:empty { display: none; }
-    .host-form input:focus-visible, .host-form button:focus-visible, .manual-host button:focus-visible, .host-option input:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
-    .controls { padding: 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; }
+    .host-form input:focus-visible, .host-form button:focus-visible, .manual-host button:focus-visible, .host-option input:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+    .controls { padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
     .control-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
-    .control-title label { color: #c9ced9; font-size: 13px; }
+    .control-title label { color: var(--label); font-size: 13px; }
+    .auto-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .auto-row > label:first-child, .accel-row > label:first-child { display: flex; flex-direction: column; gap: 2px; color: var(--label); font-size: 13px; }
+    .auto-row small, .accel-row small { color: var(--subtle); font-size: 11px; }
+    .controls.auto .slider, .controls.auto .scale { opacity: 0.4; pointer-events: none; }
     output { min-width: 42px; padding: 4px 8px; border-radius: 5px; color: #fff; background: #fb7299; font-size: 13px; font-weight: 700; text-align: center; }
-    .slider { position: relative; width: 100%; height: 18px; border-radius: 9px; background: #3a3e47; }
+    .slider { position: relative; width: 100%; height: 18px; border-radius: 9px; background: var(--track); }
     .slider-fill { position: absolute; top: 0; bottom: 0; left: 0; width: 60%; border-radius: 9px; background: #fb7299; pointer-events: none; }
     input[type="range"] { position: absolute; inset: 0; width: 100%; height: 18px; margin: 0; appearance: none; -webkit-appearance: none; border: 0; outline: 0; background: transparent; cursor: pointer; }
     input[type="range"]::-webkit-slider-runnable-track { height: 18px; background: transparent; }
     input[type="range"]::-webkit-slider-thumb { width: 24px; height: 24px; margin-top: -3px; appearance: none; -webkit-appearance: none; border: 2px solid #fff; border-radius: 50%; background: #fff; }
     input[type="range"]:focus-visible::-webkit-slider-thumb { border-color: #fb7299; }
-    .scale { display: flex; justify-content: space-between; margin-top: 5px; color: #7f8797; font-size: 10px; }
+    .scale { display: flex; justify-content: space-between; margin-top: 5px; color: var(--subtle); font-size: 10px; }
     .scale span { width: 24px; text-align: center; }
     .scale span:first-child { text-align: left; }
     .scale span:last-child { text-align: right; }
-    .notice-controls { margin-top: 12px; padding: 14px 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; }
-    .notice-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #c9ced9; font-size: 13px; }
+    .accel-controls, .notice-controls { margin-top: 12px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+    .accel-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .accel-row .switch { flex: none; }
+    .accel-row + .accel-row { margin-top: 14px; }
+    .notice-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--label); font-size: 13px; }
+    .notice-row .switch { flex: none; }
     .notice-row + .notice-row { margin-top: 14px; }
-    .debug-filters { min-width: 0; margin: 16px 0 0; padding: 12px 0 0; border: 0; border-top: 1px solid #343943; }
+    .debug-filters { min-width: 0; margin: 16px 0 0; padding: 12px 0 0; border: 0; border-top: 1px solid var(--divider); }
     .debug-filters[hidden] { display: none; }
-    .debug-filters legend { padding: 0 0 4px; color: #c9ced9; font-size: 12px; }
+    .debug-filters legend { padding: 0 0 4px; color: var(--label); font-size: 12px; }
     .debug-filter-actions { display: flex; gap: 8px; margin-bottom: 12px; }
-    .debug-filter-actions button { padding: 4px 8px; border: 1px solid #444b57; border-radius: 4px; background: #292d35; color: #d9dee8; font: inherit; font-size: 11px; cursor: pointer; }
+    .debug-filter-actions button { padding: 4px 8px; border: 1px solid var(--control-border); border-radius: 4px; background: var(--hover); color: var(--button-text); font: inherit; font-size: 11px; cursor: pointer; }
     .debug-filter-actions button:hover, .manual-host button:hover { border-color: #fb7299; }
     .debug-filter-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 8px; }
-    .debug-filter-options label { display: flex; align-items: center; gap: 7px; color: #c9ced9; font-size: 12px; cursor: pointer; }
+    .debug-filter-options label { display: flex; align-items: center; gap: 7px; color: var(--label); font-size: 12px; cursor: pointer; }
     .debug-filter-options input { flex: none; width: 15px; height: 15px; margin: 0; accent-color: #fb7299; cursor: pointer; }
-    .debug-filter-actions button:focus-visible, .debug-filter-options input:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
-    .current-threads { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; padding: 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; color: #c9ced9; font-size: 13px; }
-    .current-threads b { color: #fff; font-size: 20px; font-variant-numeric: tabular-nums; }
-    .btr-close { position: sticky; bottom: 12px; display: block; width: calc(100% - 32px); margin: 0 16px 16px; padding: 8px; border: 1px solid #444b57; border-radius: 6px; background: #292d35; color: #d9dee8; font: inherit; font-size: 13px; cursor: pointer; box-shadow: 0 -6px 12px #17191f; }
+    .debug-filter-actions button:focus-visible, .debug-filter-options input:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+    .debug-copy { display: flex; align-items: center; gap: 10px; margin-top: 16px; }
+    .debug-copy button { padding: 6px 12px; border: 1px solid #fb7299; border-radius: 6px; background: var(--hover); color: var(--text); font: inherit; font-size: 12px; cursor: pointer; }
+    .debug-copy button:hover { background: #fb7299; }
+    .debug-copy button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+    .debug-copy-status { color: var(--success); font-size: 12px; }
+    .debug-copy-status.failed { color: var(--error); }
+    .debug-copy-note { margin: 8px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+    .debug-copy-text { width: 100%; height: 120px; margin-top: 8px; padding: 6px; border: 1px solid var(--control-border); border-radius: 6px; background: var(--surface); color: var(--button-text); font: 11px/1.4 Consolas, monospace; resize: vertical; }
+    .debug-copy-text[hidden] { display: none; }
+    .current-threads { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--label); font-size: 13px; }
+    .current-threads b { color: var(--text); font-size: 20px; font-variant-numeric: tabular-nums; }
+    .btr-close { position: sticky; bottom: 12px; display: block; width: calc(100% - 32px); margin: 0 16px 16px; padding: 8px; border: 1px solid var(--control-border); border-radius: 6px; background: var(--hover); color: var(--button-text); font: inherit; font-size: 13px; cursor: pointer; box-shadow: 0 -6px 12px var(--bg); }
     .btr-close:hover { border-color: #fb7299; }
-    .btr-close:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+    .btr-close:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  `;
+
+  const LAUNCHER_CSS = `
+    .btr-launcher { position: fixed; right: 76px; bottom: 116px; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: #fb7299; color: #fff; font: 700 13px/1 Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; letter-spacing: .3px; cursor: grab; opacity: .6; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; box-shadow: 0 4px 14px rgba(0, 0, 0, .25); transition: opacity 160ms ease, transform 160ms ease, left 180ms ease, right 180ms ease; }
+    .btr-launcher:hover, .btr-launcher:focus-visible { opacity: 1; transform: scale(1.06); }
+    .btr-launcher:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+    .btr-launcher.dragging { cursor: grabbing; opacity: 1; transform: scale(1.1); transition: opacity 160ms ease, transform 160ms ease; }
+    @media (max-width: 700px) { .btr-launcher { width: 40px; height: 40px; font-size: 12px; } }
   `;
 
   let current = null;
   // bridge.js sends the stored settings when they load or change, and the page its stats.
   let latestSettings = null;
+  // The debug notices shown on this page, newest last, for the diagnostic copy.
+  const noticeHistory = [];
+
+  // Everything needed to look into a report, as text to paste into an issue. The page's own
+  // reports already leave out download addresses and account data; any address that is left
+  // is cut down to its host and path, so no signature or token goes along.
+  function diagnostics() {
+    const safely = (read) => { try { return read(); } catch (error) { return `读取失败：${String(error?.message || error)}`; } };
+    const parse = (text) => { try { return JSON.parse(text); } catch (_error) { return text; } };
+    const sections = [
+      ["环境", {
+        BTR: "2026.10.8.1",
+        脚本管理器: document.documentElement?.getAttribute("data-btr-userscript-manager") || "未知",
+        浏览器: navigator.userAgent,
+        页面: `${location.origin}${location.pathname}`,
+        时间: new Date().toISOString(),
+        语言: navigator.language,
+        窗口: `${root.innerWidth}x${root.innerHeight}`
+      }],
+      ["设置", latestSettings || "设置还没加载"]
+    ];
+    const video = root.__biliThreadRipperDebug;
+    if (typeof video?.report === "function") sections.push(["视频接管", safely(() => parse(video.report()))]);
+    const auto = root.__BILI_IDM_DOWNLOADER_FACTORY__?.autoConcurrency;
+    if (typeof auto?.status === "function") sections.push(["自动线程数", safely(() => auto.status())]);
+    // The live player often sits in a live.bilibili.com iframe, where its module runs.
+    const liveModules = [root, ...[...document.querySelectorAll("iframe")].map((frame) => safely(() => frame.contentWindow))]
+      .map((view) => safely(() => view?.__biliThreadRipperLiveDebug)).filter((api) => api && typeof api.getStats === "function");
+    liveModules.forEach((api, index) => sections.push([liveModules.length > 1 ? `直播模块 ${index + 1}` : "直播模块", safely(() => ({ stats: api.getStats(), context: api.getContext?.() }))]));
+    sections.push(["最近的 Debug 提示", noticeHistory.length
+      ? noticeHistory.map((item) => `${new Date(item.at).toISOString().slice(11, 19)} [${item.level}/${item.category}] ${item.title}${item.count > 1 ? ` ×${item.count}` : ""}${item.detail ? ` — ${item.detail}` : ""}`).join("\n")
+      : "（还没有。打开 Debug 模式以后显示过的提示才会记在这里）"]);
+    const text = sections.map(([title, value]) => `## ${title}\n${typeof value === "string" ? value : JSON.stringify(value, null, 1)}`).join("\n\n");
+    return text.replace(/(https?:\/\/[^\s"'?#]+)[?#][^\s"']*/gi, "$1");
+  }
   let latestStats = null;
   const post = (type, payload) => root.postMessage({ channel: CHANNEL, type, payload }, "*");
 
@@ -3605,11 +4486,27 @@ const chrome = (() => {
     const $ = (id) => shadow.getElementById(id);
     const enabled = $("enabled");
     const concurrency = $("concurrency");
+    const autoConcurrency = $("auto-concurrency");
+    const theme = $("theme");
+    const systemTheme = root.matchMedia("(prefers-color-scheme: dark)");
+    const systemColors = () => (systemTheme.matches ? "dark" : "light");
+    const applyTheme = () => {
+      panel.dataset.theme = theme.dataset.value === "auto" ? systemColors() : theme.dataset.value;
+    };
+    const showTheme = (value) => {
+      theme.dataset.value = value;
+      theme.title = `面板主题：${THEME_LABELS[value]}。点击切换`;
+      theme.setAttribute("aria-label", theme.title);
+      applyTheme();
+    };
+    systemTheme.addEventListener("change", applyTheme);
     const threadValue = $("thread-value");
     const sliderFill = $("slider-fill");
     const errorNotices = $("error-notices");
     const debugNotices = $("debug-notices");
     const liveEnabled = $("live-enabled");
+    const episodeEnabled = $("episode-enabled");
+    const floatingButton = $("floating-button");
     const debugFilters = $("debug-filters");
     const debugCategoryInputs = [...shadow.querySelectorAll("[data-debug-category]")];
     const customSection = $("custom-hosts");
@@ -3624,7 +4521,8 @@ const chrome = (() => {
       const index = THREAD_OPTIONS.indexOf(Number(threads));
       const safe = index < 0 ? 1 : index;
       concurrency.value = String(safe);
-      threadValue.value = String(THREAD_OPTIONS[safe]);
+      // In the automatic mode the badge says so; the slider keeps the viewer's own count.
+      threadValue.value = autoConcurrency.checked ? "自动" : String(THREAD_OPTIONS[safe]);
       concurrency.setAttribute("aria-valuetext", String(THREAD_OPTIONS[safe]));
       sliderFill.style.width = `${safe / (THREAD_OPTIONS.length - 1) * 100}%`;
     }
@@ -3679,13 +4577,19 @@ const chrome = (() => {
     }
 
     function render(settings) {
+      showTheme(settings.theme);
       enabled.checked = settings.enabled;
       for (const radio of shadow.querySelectorAll('input[name="takeover"]')) radio.checked = radio.value === settings.takeover;
+      autoConcurrency.checked = settings.autoConcurrency === true;
       setSlider(settings.concurrency);
+      concurrency.disabled = autoConcurrency.checked;
+      concurrency.closest(".controls").classList.toggle("auto", autoConcurrency.checked);
       setMode(settings.mode);
       customHosts = settings.customHosts;
       renderHosts();
-      liveEnabled.checked = settings.liveEnabled !== false;
+      liveEnabled.checked = settings.liveEnabled === true;
+      episodeEnabled.checked = settings.episodeEnabled !== false;
+      floatingButton.checked = settings.floatingButton !== false;
       errorNotices.checked = settings.errorNotices;
       debugNotices.checked = settings.debugNotices;
       debugFilters.hidden = !settings.debugNotices;
@@ -3694,12 +4598,25 @@ const chrome = (() => {
 
     const saveDebugCategories = () => save({ debugCategories: Object.fromEntries(debugCategoryInputs.map((input) => [input.dataset.debugCategory, input.checked])) });
     enabled.addEventListener("change", () => save({ enabled: enabled.checked }));
+    // Each click goes on to the next choice: from 自动 to the colors the system is not showing,
+    // then to the ones it is (now kept by hand), then back to 自动.
+    theme.addEventListener("click", () => {
+      const system = systemColors();
+      const other = system === "dark" ? "light" : "dark";
+      const current = theme.dataset.value;
+      const next = current === "auto" ? other : current === other ? system : "auto";
+      showTheme(next);
+      save({ theme: next });
+    });
     liveEnabled.addEventListener("change", () => save({ liveEnabled: liveEnabled.checked }));
+    episodeEnabled.addEventListener("change", () => save({ episodeEnabled: episodeEnabled.checked }));
+    floatingButton.addEventListener("change", () => save({ floatingButton: floatingButton.checked }));
     concurrency.addEventListener("input", () => {
       const threads = THREAD_OPTIONS[Number(concurrency.value)];
       setSlider(threads);
       save({ concurrency: threads });
     });
+    autoConcurrency.addEventListener("change", () => save({ autoConcurrency: autoConcurrency.checked }));
     for (const radio of shadow.querySelectorAll('input[name="mode"]')) {
       radio.addEventListener("change", () => {
         if (!radio.checked) return;
@@ -3745,6 +4662,26 @@ const chrome = (() => {
     for (const input of debugCategoryInputs) input.addEventListener("change", saveDebugCategories);
     $("debug-select-all").addEventListener("click", () => { for (const input of debugCategoryInputs) input.checked = true; saveDebugCategories(); });
     $("debug-select-none").addEventListener("click", () => { for (const input of debugCategoryInputs) input.checked = false; saveDebugCategories(); });
+    const copyStatus = $("debug-copy-status");
+    const copyText = $("debug-copy-text");
+    let copyStatusTimer = null;
+    $("debug-copy").addEventListener("click", async () => {
+      const text = diagnostics();
+      let copied = false;
+      try { await navigator.clipboard.writeText(text); copied = true; } catch (_error) {}
+      if (!copied) {
+        // Without the clipboard API (or its permission): select the text for the viewer.
+        copyText.hidden = false;
+        copyText.value = text;
+        copyText.focus();
+        copyText.select();
+        try { copied = document.execCommand("copy"); } catch (_error) {}
+      }
+      copyStatus.classList.toggle("failed", !copied);
+      copyStatus.textContent = copied ? "已复制" : "没能自动复制，请手动复制下面的内容";
+      clearTimeout(copyStatusTimer);
+      if (copied) copyStatusTimer = setTimeout(() => { copyStatus.textContent = ""; }, 2500);
+    });
 
     // Keys typed into the panel belong to it. The shadow root hides the input from the page,
     // so the player's shortcuts (space, F, arrows) would otherwise react to them.
@@ -3762,11 +4699,14 @@ const chrome = (() => {
       if (current?.host !== host) return;
       current = null;
       clearInterval(timer);
+      systemTheme.removeEventListener("change", applyTheme);
+      launcher?.apply();
       document.removeEventListener("keydown", onKey, true);
       dialog.remove();
     };
     // Changes made elsewhere (the gear menu, another tab) arrive as new settings.
     current = { host, close, render };
+    launcher?.apply();
     backdrop.addEventListener("click", close);
     closeButton.addEventListener("click", close);
     document.addEventListener("keydown", onKey, true);
@@ -3782,17 +4722,204 @@ const chrome = (() => {
   }
 
   const toggle = () => (current ? current.close() : open());
+
+  // The button in the corner of every bilibili page. The userscript manager's menu is not
+  // obvious (and on the home page people do not find it at all), so the panel needs a way in
+  // that is always visible.
+  // It hides while the video is fullscreen and while the panel itself is open.
+  const launcher = (() => {
+    if (root.top !== root) return null;
+    const MARGIN = 12;
+    // How far a press has to travel before it counts as dragging rather than a click.
+    const DRAG_SLOP = 4;
+    // Let go this close to the left or right edge and it snaps flush to it; let go anywhere
+    // else and it simply stays where it was put.
+    const SNAP_MS = 72;
+    let host = null;
+    let button = null;
+    let wanted = true;
+    // Where the viewer left it, as shares of the window: 0 means stuck to the left edge, 1 to
+    // the right edge, anything between is a free spot. null: never moved.
+    let leftRatio = null;
+    let topRatio = null;
+    let dragging = null;
+
+    // Bilibili fills the screen in two ways: the browser fullscreen API, and its own 网页全屏,
+    // which only resizes the player inside the page. Rather than follow Bilibili class names,
+    // this asks the picture itself: a video that covers the window is a video being watched
+    // full screen, whichever way it got there.
+    const fullscreen = () => {
+      if (document.fullscreenElement || document.webkitFullscreenElement || document.webkitIsFullScreen) return true;
+      const width = root.innerWidth, height = root.innerHeight;
+      if (!width || !height) return false;
+      for (const video of document.querySelectorAll("video")) {
+        const box = video.getBoundingClientRect();
+        if (box.width >= width * 0.92 && box.height >= height * 0.92) return true;
+      }
+      return false;
+    };
+
+    const clamp = (value, low, high) => Math.min(Math.max(value, low), high);
+
+    // Puts it back where it was left. Without a saved spot it sits where it always did: to the
+    // left of Bilibili's own column of round buttons, near the bottom.
+    function place() {
+      if (!button) return;
+      const size = button.offsetHeight || 44;
+      const width = root.innerWidth || 0, height = root.innerHeight || 0;
+      if (leftRatio === null || topRatio === null) {
+        button.style.top = `${Math.round(Math.max(MARGIN, height - size - 116))}px`;
+        button.style.right = "76px";
+        button.style.left = "auto";
+        button.style.bottom = "auto";
+        return;
+      }
+      button.style.top = `${Math.round(clamp(topRatio * height, MARGIN, Math.max(MARGIN, height - size - MARGIN)))}px`;
+      button.style.bottom = "auto";
+      if (leftRatio >= 1) {
+        button.style.right = `${MARGIN}px`;
+        button.style.left = "auto";
+        return;
+      }
+      button.style.left = `${Math.round(clamp(leftRatio * width, MARGIN, Math.max(MARGIN, width - size - MARGIN)))}px`;
+      button.style.right = "auto";
+    }
+
+    function startDrag(event) {
+      if (event.button !== undefined && event.button !== 0) return;
+      const box = button.getBoundingClientRect();
+      dragging = {
+        pointerId: event.pointerId,
+        grabX: event.clientX - box.left,
+        grabY: event.clientY - box.top,
+        fromX: event.clientX,
+        fromY: event.clientY,
+        moved: false
+      };
+      try { button.setPointerCapture(event.pointerId); } catch (_error) {}
+    }
+
+    function moveDrag(event) {
+      if (!dragging || event.pointerId !== dragging.pointerId) return;
+      if (!dragging.moved && Math.hypot(event.clientX - dragging.fromX, event.clientY - dragging.fromY) < DRAG_SLOP) return;
+      dragging.moved = true;
+      button.classList.add("dragging");
+      const size = button.offsetHeight || 44;
+      const width = root.innerWidth, height = root.innerHeight;
+      // Kept as numbers: where it lands is decided from these, not from a fresh layout
+      // read, which the browser is free to postpone until the pointer is already up.
+      dragging.left = Math.round(clamp(event.clientX - dragging.grabX, MARGIN, width - size - MARGIN));
+      dragging.top = Math.round(clamp(event.clientY - dragging.grabY, MARGIN, height - size - MARGIN));
+      dragging.size = size;
+      button.style.left = `${dragging.left}px`;
+      button.style.top = `${dragging.top}px`;
+      button.style.right = "auto";
+      event.preventDefault();
+    }
+
+    function endDrag(event) {
+      if (!dragging || event.pointerId !== dragging.pointerId) return;
+      const { moved, left = 0, top = 0, size = 44 } = dragging;
+      try { button.releasePointerCapture(dragging.pointerId); } catch (_error) {}
+      dragging = null;
+      button.classList.remove("dragging");
+      if (!moved) return;
+      // Dropped within reach of the left or right edge: snap flush to it, and remember the
+      // edge rather than the pixel, so it stays there whatever the window size. Dropped
+      // anywhere else: it stays exactly where it was put.
+      const width = root.innerWidth || 1;
+      if (left <= SNAP_MS) leftRatio = 0;
+      else if (left + size >= width - SNAP_MS) leftRatio = 1;
+      else leftRatio = clamp(left / width, 0, 1);
+      topRatio = clamp(top / (root.innerHeight || 1), 0, 1);
+      place();
+      post("settings-update", { floatingButtonLeft: leftRatio, floatingButtonTop: topRatio });
+    }
+
+    function mount() {
+      if (host?.isConnected) return;
+      host = document.createElement("div");
+      host.id = LAUNCHER_ID;
+      host.style.cssText = "all:initial!important;position:fixed!important;right:0!important;bottom:0!important;width:0!important;height:0!important;z-index:2147483645!important;";
+      const shadow = host.attachShadow({ mode: "open" });
+      const style = document.createElement("style");
+      style.textContent = LAUNCHER_CSS;
+      button = document.createElement("button");
+      button.type = "button";
+      button.className = "btr-launcher";
+      button.title = "线程撕裂者设置（可以拖动）";
+      button.setAttribute("aria-label", "线程撕裂者设置");
+      button.textContent = "BTR";
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        // A drag that ended on the button itself must not also open the panel.
+        if (button.dataset.dragged === "true") {
+          button.dataset.dragged = "";
+          return;
+        }
+        toggle();
+      });
+      button.addEventListener("pointerdown", startDrag);
+      button.addEventListener("pointermove", moveDrag);
+      for (const type of ["pointerup", "pointercancel"]) {
+        button.addEventListener(type, (event) => {
+          const moved = Boolean(dragging?.moved);
+          endDrag(event);
+          if (moved) button.dataset.dragged = "true";
+        });
+      }
+      shadow.append(style, button);
+      (document.body || document.documentElement).append(host);
+      place();
+    }
+
+    function apply() {
+      const show = wanted && !fullscreen() && !current;
+      if (!show) {
+        host?.remove();
+        return;
+      }
+      mount();
+      // Bilibili replaces large parts of the page when you navigate; put it back if it went.
+      if (!host.isConnected) (document.body || document.documentElement).append(host);
+      if (!dragging) place();
+    }
+
+    const update = (settings) => {
+      wanted = settings?.floatingButton !== false;
+      // null (never dragged) must stay null: Number(null) is 0, which would pin it to a corner.
+      const ratio = (value) => (value != null && Number(value) >= 0 && Number(value) <= 1 ? Number(value) : null);
+      leftRatio = ratio(settings?.floatingButtonLeft);
+      topRatio = ratio(settings?.floatingButtonTop);
+      apply();
+    };
+    for (const type of ["fullscreenchange", "webkitfullscreenchange"]) document.addEventListener(type, apply, true);
+    root.addEventListener("resize", apply);
+    // A page that swaps its body (the SPA navigations) drops the button with it.
+    setInterval(apply, 2000);
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", apply, { once: true });
+    // The button is on by default, so it is there before the stored settings arrive.
+    apply();
+    return { update, apply };
+  })();
+
   root.addEventListener("message", (event) => {
     if (event.source !== root || event.data?.channel !== CHANNEL) return;
     if (event.data.type === "settings") {
       latestSettings = core.normalizeSettings(event.data.payload);
+      launcher?.update(latestSettings);
       current?.render(latestSettings);
     } else if (event.data.type === "stats") {
       latestStats = event.data.payload;
+    } else if (event.data.type === "debug-notices") {
+      for (const item of [].concat(event.data.payload || [])) {
+        noticeHistory.push({ at: Number(item?.at) || Date.now(), level: String(item?.level || "info"), category: String(item?.category || "other"), title: String(item?.title || ""), detail: String(item?.detail || ""), count: Number(item?.count) || 1 });
+        if (noticeHistory.length > 100) noticeHistory.shift();
+      }
     } else if (event.data.type === "open-settings" && root.top === root) {
-      // The toolbar icon toggles the panel; "自定义" in the gear menu only opens it.
-      if (event.data.payload?.toggle) toggle();
-      else open();
+      // "自定义" in the gear menu.
+      open();
     }
   });
   // The userscript manager's menu entry.
@@ -3814,9 +4941,11 @@ const chrome = (() => {
   const SETTINGS_ID = "__bilibili_thread_ripper_native_settings__";
   const SETTINGS_STYLE_ID = "__bilibili_thread_ripper_native_settings_style__";
   if (root[INSTALL_FLAG]) return;
-  // The live site has its own module (live-hook.js); the userscript build loads every
-  // file everywhere, so the video takeover keeps off that hostname.
-  if (/^live\.bilibili\.com$/i.test(root.location?.hostname || "")) return;
+  // The userscript runs on every bilibili.com page. The video takeover belongs to the video
+  // pages only: the live site has its
+  // own module (live-hook.js), and elsewhere only the settings panel is wanted.
+  const pageHost = root.location?.hostname || "";
+  if (/(^|\.)bilibili\.com$/i.test(pageHost) && !/^(www|m)\.bilibili\.com$/i.test(pageHost)) return;
 
   const core = root.__BILI_RANGE_CORE__;
   const playerFactory = root.__BILI_NATIVE_MSE_PLAYER_FACTORY__;
@@ -3868,8 +4997,17 @@ const chrome = (() => {
   let autoRetakeAt = 0;
   let transferSequence = 1;
   const transfers = new Map();
+  // 自动线程数 lives in the downloader; its steps are reported here.
+  const autoThreads = root.__BILI_IDM_DOWNLOADER_FACTORY__?.autoConcurrency || null;
+  autoThreads?.subscribe(({ threads, previous, reason }) => {
+    if (!settings.autoConcurrency) return;
+    stats.autoThreads = threads;
+    notices?.log(threads > previous ? "线程数加到 " + threads : "线程数退回 " + threads, `${previous} → ${threads}：${reason}。`, "info", "", undefined, "download");
+    schedulePublish();
+  });
+
   const stats = {
-    version: "0.9.4.3",
+    version: "2026.10.8.1",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -3879,6 +5017,7 @@ const chrome = (() => {
     acceleratedBytes: 0,
     parallelSubrequests: 0,
     activeThreads: 0,
+    autoThreads: 0,
     totalSpeedBps: 0,
     threadSpeeds: [],
     discoveredCdns: 0,
@@ -4030,7 +5169,7 @@ const chrome = (() => {
       if (host) lastHostByKind[event.kind === "audio" ? "audio" : "video"] = host;
       trackBusy(kind, now);
       // One segment starts and ends dozens of transfers within the same moment. Publishing
-      // each of them at once copied the whole thread list to the extension every time.
+      // each of them at once posted the whole thread list every time.
       schedulePublish();
       return id;
     }
@@ -4122,6 +5261,9 @@ const chrome = (() => {
     const match = /\/video\/(BV[0-9A-Za-z]+|av\d+)/i.exec(location.pathname);
     if (match) return match[1];
 
+    const episode = /^\/bangumi\/play\/(ep\d+|ss\d+)/i.exec(location.pathname);
+    if (episode) return episode[1];
+
     if (/^\/list\//i.test(location.pathname)) {
       const bvid = new URLSearchParams(location.search).get("bvid") || "";
       if (/^BV[0-9A-Za-z]+$/i.test(bvid)) return bvid;
@@ -4133,6 +5275,14 @@ const chrome = (() => {
   function routeIdentity() {
     const pathId = urlPathId();
     if (!pathId) return null;
+    if (/^(ep|ss)/i.test(pathId)) {
+      // A season address plays the episode its embedded playinfo names.
+      const embedded = normalizePlayinfo(root.__playinfo__);
+      const epId = /^ep/i.test(pathId) ? Number(pathId.slice(2)) || 0
+        : embedded?.season === Number(pathId.slice(2)) ? embedded.episode : 0;
+      if (!epId) return null;
+      return { aid: 0, bvid: "", epId, part: 1, key: `ep${epId}:p1`, videoKey: `ep${epId}` };
+    }
     const podBvid = activePodBvid();
     const pathVideoKey = /^BV/i.test(pathId) ? pathId.toLowerCase() : `av${Number(pathId.slice(2)) || 0}`;
     const podVideoKey = podBvid ? podBvid.toLowerCase() : "";
@@ -4151,7 +5301,39 @@ const chrome = (() => {
       ? 1
       : Math.max(1, Number(new URLSearchParams(location.search).get("p")) || 1);
     const videoKey = bvid ? bvid.toLowerCase() : `av${aid}`;
-    return { aid, bvid, part, key: `${videoKey}:p${part}`, videoKey };
+    const node = interactiveNode(videoKey, part);
+    return { aid, bvid, part, key: nodeRouteKey(videoKey, part, node), videoKey, cid: node };
+  }
+
+  // An interactive video (互动视频) plays its branches as separate CIDs under the same BVID
+  // and address; the player itself knows which branch is on. The first branch keeps the
+  // ordinary route key, so the takeover does not start over when the player reports it.
+  // Returns the CID of the branch playing now when it is not the first one, otherwise 0.
+  function interactiveFirstCid(videoKey, part) {
+    try {
+      const state = root.__INITIAL_STATE__;
+      if (stateIdentity(state)?.videoKey !== videoKey || Number(state.videoData?.rights?.is_stein_gate) !== 1) return 0;
+      return Number(state.videoData.pages?.[part - 1]?.cid || state.videoData.cid) || 0;
+    } catch (_error) {
+      return 0;
+    }
+  }
+
+  function interactiveNode(videoKey, part) {
+    const first = interactiveFirstCid(videoKey, part);
+    if (!first) return 0;
+    try {
+      const manifest = root.player?.getManifest?.();
+      if (String(manifest?.bvid || "").toLowerCase() !== videoKey && `av${Number(manifest?.aid) || 0}` !== videoKey) return 0;
+      const cid = Number(manifest.cid) || 0;
+      return cid && cid !== first ? cid : 0;
+    } catch (_error) {
+      return 0;
+    }
+  }
+
+  function nodeRouteKey(videoKey, part, node) {
+    return node ? `${videoKey}:p${part}:n${node}` : `${videoKey}:p${part}`;
   }
 
   function stateIdentity(state) {
@@ -4166,6 +5348,30 @@ const chrome = (() => {
     return Boolean((playinfo?.data || playinfo)?.dash);
   }
 
+  const PLAYURL_PATTERN = /\/x\/player\/(?:wbi\/)?playurl/i;
+  const EPISODE_PLAYURL_PATTERN = /\/ogv\/player\/playview|\/pgc\/player\/web\/(?:v2\/)?playurl/i;
+  const isPlayurl = (url) => PLAYURL_PATTERN.test(String(url)) || EPISODE_PLAYURL_PATTERN.test(String(url));
+
+  // Bangumi answers put the stream in video_info, next to the episode's arc (aid, cid, bvid)
+  // and, in the playinfo embedded in the page, the episode and season it belongs to.
+  function normalizePlayinfo(payload) {
+    const body = payload?.data || payload?.result;
+    if (!body?.video_info) return payload;
+    return {
+      code: payload.code,
+      data: body.video_info,
+      arc: body.arc || null,
+      episode: Number(body.supplement?.ogv_episode_info?.episode_id) || 0,
+      season: Number(body.supplement?.ogv_season_info?.season_id) || 0
+    };
+  }
+
+  function unsupportedEpisode(playinfo) {
+    if (playinfo?.data?.is_drm) return "这一集有数字版权保护，交给 B 站自己的播放器。";
+    if (playinfo?.data?.is_preview) return "这一集只能试看，交给 B 站自己的播放器。";
+    return "";
+  }
+
   const routePlayinfo = new Map();
   const routeCids = new Map();
   const bootRouteKey = routeIdentity()?.key || "";
@@ -4174,7 +5380,7 @@ const chrome = (() => {
   // epoch, 0 if unknown).
   function playinfoAddresses(playinfo) {
     const dash = (playinfo?.data || playinfo)?.dash;
-    return [...(dash?.video || []), ...(dash?.audio || [])].map((item) => {
+    return [...(dash?.video || []), ...(dash?.audio || []), ...[].concat(dash?.dolby?.audio || [], dash?.flac?.audio || [])].map((item) => {
       try {
         const url = new URL(item.baseUrl || item.base_url);
         return { key: `${item.id}|${item.codecid ?? item.codecs ?? ""}|${url.pathname}`, deadline: Number(url.searchParams.get("deadline")) || 0 };
@@ -4197,7 +5403,8 @@ const chrome = (() => {
     routePlayinfo.delete(identity.key);
     routePlayinfo.set(identity.key, playinfo);
     if (Number(cid) > 0) routeCids.set(identity.key, Number(cid));
-    while (routePlayinfo.size > 8) {
+    // An interactive video's player asks for the next branches ahead of time, several at once.
+    while (routePlayinfo.size > 16) {
       const oldest = routePlayinfo.keys().next().value;
       routePlayinfo.delete(oldest);
       routeCids.delete(oldest);
@@ -4208,6 +5415,12 @@ const chrome = (() => {
   function currentPlayinfo(identity) {
     const cached = routePlayinfo.get(identity?.key);
     if (isDashPlayinfo(cached)) return cached;
+    if (identity?.epId) {
+      const embedded = normalizePlayinfo(root.__playinfo__);
+      const playinfo = embedded?.episode === identity.epId ? embedded : null;
+      if (unsupportedEpisode(playinfo)) return playinfo;
+      return cachePlayinfo(identity, playinfo, playinfo?.arc?.cid) ? playinfo : null;
+    }
     try {
       const initialIdentity = stateIdentity(root.__INITIAL_STATE__);
       if (identity?.key === bootRouteKey && initialIdentity?.videoKey === identity?.videoKey && isDashPlayinfo(root.__playinfo__)) {
@@ -4246,20 +5459,55 @@ const chrome = (() => {
     catch (_error) { return 0; }
   }
 
-  function capturePlayinfoRequest(url) {
-    if (!/\/x\/player\/(?:wbi\/)?playurl/i.test(String(url))) return null;
+  // playview names the episode in its JSON body, the older playurl in its query.
+  function requestedEpisode(url, body) {
+    try {
+      const fromQuery = Number(new URL(String(url), location.href).searchParams.get("ep_id")) || 0;
+      if (fromQuery) return fromQuery;
+      return typeof body === "string" ? Number(JSON.parse(body)?.video_index?.ogv_episode_id) || 0 : 0;
+    } catch (_error) {
+      return 0;
+    }
+  }
+
+  function capturePlayinfoRequest(url, body) {
+    if (EPISODE_PLAYURL_PATTERN.test(String(url))) {
+      const identity = routeIdentity();
+      const epId = requestedEpisode(url, body);
+      if (!identity?.epId || epId !== identity.epId) return null;
+      return { routeKey: identity.key, videoKey: identity.videoKey, epId, cid: 0 };
+    }
+    if (!PLAYURL_PATTERN.test(String(url))) return null;
     const identity = routeIdentity();
     const videoKey = requestedVideoKey(url);
     const cid = requestedCid(url);
     if (!identity || !videoKey || videoKey !== identity.videoKey || !cid) return null;
-    return { routeKey: identity.key, videoKey, cid };
+    // In an interactive video the request names its branch.
+    const first = interactiveFirstCid(identity.videoKey, identity.part);
+    const routeKey = first ? nodeRouteKey(identity.videoKey, identity.part, cid === first ? 0 : cid) : identity.key;
+    return { routeKey, videoKey, cid };
   }
 
   function observePlayinfo(url, payload, requestContext = null) {
-    if (!/\/x\/player\/(?:wbi\/)?playurl/i.test(String(url)) || !isDashPlayinfo(payload)) return;
+    if (!isPlayurl(url)) return;
+    payload = normalizePlayinfo(payload);
+    if (!isDashPlayinfo(payload)) return;
     const context = requestContext || capturePlayinfoRequest(url);
     const identity = routeIdentity();
-    if (!context || !identity || context.routeKey !== identity.key || context.videoKey !== identity.videoKey) return;
+    if (!context || !identity || context.videoKey !== identity.videoKey) return;
+    // A branch the interactive player fetched ahead of time: kept for when it plays.
+    if (context.routeKey !== identity.key && interactiveFirstCid(identity.videoKey, identity.part)) {
+      cachePlayinfo({ key: context.routeKey }, payload, context.cid);
+      return;
+    }
+    if (context.routeKey !== identity.key) return;
+    // The episode ID in the route already tells episodes apart, so no CID check is needed.
+    if (identity.epId) {
+      if (unsupportedEpisode(payload)) return;
+      cachePlayinfo(identity, payload, payload.arc?.cid);
+      usePlayinfo(identity, payload);
+      return;
+    }
     const cid = Number(context.cid) || 0;
     const expectedCid = routeCids.get(identity.key) || 0;
     // The same BVID can contain many parts. A late response from the previous
@@ -4269,6 +5517,10 @@ const chrome = (() => {
     if (!cid || (expectedCid && cid !== expectedCid)) return;
     if (!expectedCid) routeCids.set(identity.key, cid);
     cachePlayinfo(identity, payload, cid);
+    usePlayinfo(identity, payload);
+  }
+
+  function usePlayinfo(identity, payload) {
     if (player && playerRoute === identity.key) {
       const observedLifecycle = playerLifecycle;
       player.updatePlayinfo?.(payload).catch((error) => {
@@ -4290,13 +5542,13 @@ const chrome = (() => {
   }
 
   function observeFetchResponse(url, response, requestContext) {
-    if (!/\/x\/player\/(?:wbi\/)?playurl/i.test(String(url))) return;
+    if (!isPlayurl(url)) return;
     response.clone().json().then((payload) => observePlayinfo(url, payload, requestContext)).catch(() => {});
   }
 
   root.fetch = function (...args) {
     const url = typeof args[0] === "string" || args[0] instanceof URL ? String(args[0]) : String(args[0]?.url || "");
-    const requestContext = capturePlayinfoRequest(url);
+    const requestContext = capturePlayinfoRequest(url, args[1]?.body);
     const pending = nativeFetch(...args);
     pending.then((response) => observeFetchResponse(response.url || url, response, requestContext)).catch(() => {});
     return pending;
@@ -4316,11 +5568,12 @@ const chrome = (() => {
     };
     xhrPrototype.send = function (...args) {
       const url = xhrUrls.get(this) || "";
-      if (/\/x\/player\/(?:wbi\/)?playurl/i.test(url)) {
+      if (isPlayurl(url)) {
+        const requestContext = xhrContexts.get(this) || capturePlayinfoRequest(url, args[0]);
         this.addEventListener("load", () => {
           try {
             const payload = this.responseType === "json" ? this.response : JSON.parse(this.responseText);
-            observePlayinfo(this.responseURL || url, payload, xhrContexts.get(this));
+            observePlayinfo(this.responseURL || url, payload, requestContext);
           } catch (_error) {}
         }, { once: true });
       }
@@ -4381,7 +5634,10 @@ const chrome = (() => {
   // refresh: new addresses for the video that is already playing. Its CID is known by then,
   // so the video information is not asked for again, and the takeover notices stay quiet.
   async function fetchRoutePlayinfo(identity, signal, refresh = false) {
-    let cid = refresh ? Number(routeCids.get(identity.key)) || 0 : 0;
+    if (identity.epId) return fetchEpisodePlayinfo(identity, signal, refresh);
+    // A branch of an interactive video carries its own CID; the video information only
+    // names the first branch.
+    let cid = Number(identity.cid) || (refresh ? Number(routeCids.get(identity.key)) || 0 : 0);
     let canonicalBvid = String(identity.bvid || "");
     let canonicalAid = Number(identity.aid) || 0;
     if (!cid) {
@@ -4414,6 +5670,23 @@ const chrome = (() => {
     if (Number(playinfo?.code) !== 0 || !isDashPlayinfo(playinfo)) throw new Error(playinfo?.message || "新视频没有 DASH 播放清单");
     if (signal?.aborted) throw signal.reason || new DOMException("播放清单请求已取消", "AbortError");
     cachePlayinfo(identity, playinfo, cid);
+    if (!refresh) notices?.log("已经拿到视频下载地址", "接下来开始准备多线程下载。", "success", "", identity.key, "takeover");
+    return playinfo;
+  }
+
+  async function fetchEpisodePlayinfo(identity, signal, refresh) {
+    const response = await nativeFetch(`${BILIBILI_API_ORIGIN}/pgc/player/web/v2/playurl?ep_id=${identity.epId}&qn=127&fnval=4048&fnver=0&fourk=1`, {
+      credentials: "include",
+      signal
+    });
+    if (!response.ok) throw new Error(`读取播放清单失败（HTTP ${response.status}）`);
+    const payload = await response.json();
+    const playinfo = normalizePlayinfo(payload);
+    if (Number(payload?.code) !== 0 || !playinfo?.data) throw new Error(payload?.message || "读取播放清单失败");
+    if (signal?.aborted) throw signal.reason || new DOMException("播放清单请求已取消", "AbortError");
+    if (unsupportedEpisode(playinfo)) return playinfo;
+    if (!isDashPlayinfo(playinfo)) throw new Error("这一集没有 DASH 播放清单");
+    cachePlayinfo(identity, playinfo);
     if (!refresh) notices?.log("已经拿到视频下载地址", "接下来开始准备多线程下载。", "success", "", identity.key, "takeover");
     return playinfo;
   }
@@ -4497,7 +5770,7 @@ const chrome = (() => {
     const style = document.createElement("style");
     style.id = SETTINGS_STYLE_ID;
     style.textContent = `
-      #${SETTINGS_ID}{margin:0 0 20px;color:#fff;font-size:12px}
+      #${SETTINGS_ID}{margin:0 0 20px;color:#fff;font-size:12px;user-select:none;-webkit-user-select:none}
       #${SETTINGS_ID} .btr-native-setting-group{margin:0 0 16px}
       #${SETTINGS_ID} .btr-native-setting-title{margin:0 0 8px;color:#fff}
       #${SETTINGS_ID} .bui-radio-group{display:flex!important;flex-wrap:wrap!important;gap:8px!important;margin:0!important}
@@ -4525,7 +5798,7 @@ const chrome = (() => {
           { label: "海外 CDN", value: "overseas" },
           { label: "自定义", value: "custom" }
         ], settings.mode),
-        settingGroup("并发线程", "btr-native-concurrency", THREAD_OPTIONS.map((value) => ({ label: String(value), value })), settings.concurrency)
+        settingGroup("并发线程", "btr-native-concurrency", [{ label: "自动", value: "auto" }, ...THREAD_OPTIONS.map((value) => ({ label: String(value), value }))], settings.autoConcurrency ? "auto" : settings.concurrency)
       );
       panel.addEventListener("change", (event) => {
         const input = event.target;
@@ -4533,8 +5806,12 @@ const chrome = (() => {
         if (input.name === "btr-native-mode" && ["mainland", "overseas", "custom"].includes(input.value)) {
           root.postMessage({ channel: CHANNEL, type: "settings-update", payload: { mode: input.value } }, "*");
         } else if (input.name === "btr-native-concurrency") {
-          const concurrency = Number(input.value);
-          if (THREAD_OPTIONS.includes(concurrency)) root.postMessage({ channel: CHANNEL, type: "settings-update", payload: { concurrency } }, "*");
+          if (input.value === "auto") {
+            root.postMessage({ channel: CHANNEL, type: "settings-update", payload: { autoConcurrency: true } }, "*");
+          } else {
+            const concurrency = Number(input.value);
+            if (THREAD_OPTIONS.includes(concurrency)) root.postMessage({ channel: CHANNEL, type: "settings-update", payload: { autoConcurrency: false, concurrency } }, "*");
+          }
         }
       });
       // The servers of the custom mode are picked in the settings panel, so "自定义" opens it,
@@ -4549,7 +5826,9 @@ const chrome = (() => {
       mount.insertBefore(panel, before || mount.firstChild);
     }
     for (const input of panel.querySelectorAll('input[name="btr-native-mode"]')) input.checked = input.value === settings.mode;
-    for (const input of panel.querySelectorAll('input[name="btr-native-concurrency"]')) input.checked = Number(input.value) === settings.concurrency;
+    for (const input of panel.querySelectorAll('input[name="btr-native-concurrency"]')) {
+      input.checked = settings.autoConcurrency ? input.value === "auto" : Number(input.value) === settings.concurrency;
+    }
   }
 
   function scheduleSettingsMenuSync() {
@@ -4685,6 +5964,7 @@ const chrome = (() => {
   // A pending switch therefore arms a short fast loop instead of waiting for the next
   // one-second tick.
   let resolvedSwitchToken = null;
+  let fastResolveToken = null;
   let fastResolveTimer = null;
   let fastResolveUntil = 0;
   function resolveNativeQualitySwitch() {
@@ -4692,7 +5972,7 @@ const chrome = (() => {
     try {
       const pending = root.player?.__core?.()?.qnSwitchingInfo?.video;
       if (!pending?.switching || typeof pending.resolve !== "function" || resolvedSwitchToken === pending) return;
-      armFastResolve();
+      armFastResolve(pending);
       if (stats.playerState !== "ready") return;
       const target = nativeQuality();
       const playingId = Number(player.getDebug?.()?.qualityId) || 0;
@@ -4703,9 +5983,12 @@ const chrome = (() => {
     } catch (_error) {}
   }
 
-  function armFastResolve() {
-    fastResolveUntil = Date.now() + 15000;
-    if (fastResolveTimer) return;
+  function armFastResolve(pending) {
+    if (fastResolveToken !== pending) {
+      fastResolveToken = pending;
+      fastResolveUntil = Date.now() + 15000;
+    }
+    if (fastResolveTimer || Date.now() > fastResolveUntil) return;
     fastResolveTimer = setInterval(() => {
       resolveNativeQualitySwitch();
       suppressNativeSchedulers();
@@ -4729,6 +6012,7 @@ const chrome = (() => {
     catch (_error) { return []; }
   }
 
+  const stoppedSchedulers = new WeakSet();
   function suppressNativeSchedulers() {
     if (!player || player.nativeTransport || playerContainer?.dataset.btrMseActive !== "true") return;
     for (const processor of nativeStreamProcessors()) {
@@ -4736,6 +6020,7 @@ const chrome = (() => {
         const scheduler = processor?.getScheduleController?.();
         if (scheduler?.isStarted?.() && typeof scheduler.stop === "function") {
           scheduler.stop();
+          stoppedSchedulers.add(scheduler);
           remember("native scheduler stopped", String(processor.getType?.() || ""));
         }
       } catch (_error) {}
@@ -4746,7 +6031,10 @@ const chrome = (() => {
     for (const processor of nativeStreamProcessors()) {
       try {
         const scheduler = processor?.getScheduleController?.();
-        if (scheduler && scheduler.isStarted?.() === false && typeof scheduler.start === "function") scheduler.start();
+        if (scheduler && stoppedSchedulers.has(scheduler) && scheduler.isStarted?.() === false && typeof scheduler.start === "function") {
+          scheduler.start();
+          stoppedSchedulers.delete(scheduler);
+        }
       } catch (_error) {}
     }
   }
@@ -4756,6 +6044,16 @@ const chrome = (() => {
   function nativeCodec() {
     try { return { 1: "hevc", 2: "avc", 3: "av1" }[root.localStorage.getItem("bilibili_player_codec_prefer_type")] || ""; }
     catch (_error) { return ""; }
+  }
+
+  // The audio picked with the player's Hi-Res / 杜比全景声 buttons: 0 the ordinary track,
+  // 1 杜比全景声, 2 Hi-Res (newA of getQuality()). Bilibili reloads its source when it
+  // changes, and the takeover that follows reads it again.
+  function nativeAudio() {
+    try {
+      const audio = Math.trunc(Number(root.player?.getQuality?.()?.newA)) || 0;
+      return audio === 1 || audio === 2 ? audio : 0;
+    } catch (_error) { return 0; }
   }
 
   function syncNativeCodec() {
@@ -4890,7 +6188,8 @@ const chrome = (() => {
       return;
     }
     const identity = routeIdentity();
-    if (!settings.enabled || !identity) {
+    // 剧集加速 switched off leaves episode pages to Bilibili, like the master switch does.
+    if (!settings.enabled || !identity || (identity.epId && settings.episodeEnabled === false)) {
       pendingPodSwitch = null;
       clearTakeoverFailure();
       stats.lastError = "";
@@ -4918,7 +6217,10 @@ const chrome = (() => {
     const container = findContainer();
     // Bilibili's playback core appears a moment after its player. The compatibility mode
     // needs it, so each video waits briefly for it instead of falling back at once.
-    const rangeTransport = settings.takeover === "compat" ? root.__BILI_NATIVE_RANGE_PLAYER_FACTORY__ : null;
+    // Episodes are only ever sped up in the compatibility mode: Bilibili's own player keeps
+    // playing them, whatever the takeover setting says.
+    const compat = settings.takeover === "compat" || Boolean(identity.epId);
+    const rangeTransport = compat ? root.__BILI_NATIVE_RANGE_PLAYER_FACTORY__ : null;
     if (container && rangeTransport && !rangeTransport.supports(container)) {
       if (nativeCoreWait?.route !== route) nativeCoreWait = { route, at: Date.now() };
       if (Date.now() - nativeCoreWait.at < 3000) {
@@ -4932,6 +6234,16 @@ const chrome = (() => {
       stats.playerState = stats.takeoverError?.route === route ? "error" : "waiting";
       schedulePublish();
       restartTimer = setTimeout(startPlayer, 350);
+      return;
+    }
+    // Where the compatibility mode cannot hold Bilibili's core, an episode is left to
+    // Bilibili rather than taken over in full.
+    if (identity.epId && !rangeTransport?.supports(container)) {
+      failedRoute = route;
+      notices?.log("没有接管这一集", "剧集只用兼容模式加速，但现在接不上 B 站的播放器，这一集交给 B 站自己播放。", "info", "", route, "takeover");
+      if (player) stopPlayer(true);
+      stats.playerState = "native-fallback";
+      publish();
       return;
     }
     const generation = routeGeneration;
@@ -4958,6 +6270,15 @@ const chrome = (() => {
       }
       if (generation !== routeGeneration || routeIdentity()?.key !== route) return;
     }
+    const unsupported = identity.epId ? unsupportedEpisode(playinfo) : "";
+    if (unsupported) {
+      failedRoute = route;
+      notices?.log("没有接管这一集", unsupported, "info", "", route, "takeover");
+      if (player) stopPlayer(true);
+      stats.playerState = "native-fallback";
+      publish();
+      return;
+    }
     if (player) stopPlayer(false);
     stats.playerState = "loading";
     stats.lastError = "";
@@ -4971,18 +6292,19 @@ const chrome = (() => {
     }
     const preferredQuality = nativeQuality();
     const preferredCodec = nativeCodec();
+    const preferredAudio = nativeAudio();
     const resumeAfterStop = takeResumeHint(autoRetakeRoute === route && autoRetakeCount > 0);
     for (const meter of Object.values(speedMeters)) meter.shown = 0;
     try {
-      // The compatibility mode needs Bilibili's own playback core; without it the video is
-      // taken over as usual.
-      const transport = settings.takeover === "compat" ? root.__BILI_NATIVE_RANGE_PLAYER_FACTORY__ : null;
-      const factory = transport?.supports(container) ? transport : playerFactory;
+      // The compatibility mode needs Bilibili's own playback core; without it an ordinary
+      // video is taken over as usual (an episode never gets this far without it).
+      const factory = rangeTransport?.supports(container) ? rangeTransport : playerFactory;
       const nextPlayer = factory.createNativePlayer({
         container,
         identity,
         preferredQuality,
         preferredCodec,
+        preferredAudio,
         // A collection item is a different video. Its native <video> element
         // can still expose the previous item's currentTime until new metadata
         // arrives, so carrying that value across would clamp short videos to
@@ -5103,20 +6425,24 @@ const chrome = (() => {
       settingsLoaded = true;
       notices?.configure(settings);
       const serversChanged = settings.mode === "custom" && previous.customHosts.join(",") !== settings.customHosts.join(",");
-      if (!hadLoadedSettings || previous.enabled !== settings.enabled || previous.takeover !== settings.takeover || previous.mode !== settings.mode || previous.concurrency !== settings.concurrency || serversChanged) {
+      if (!hadLoadedSettings || previous.enabled !== settings.enabled || previous.takeover !== settings.takeover || previous.mode !== settings.mode || previous.concurrency !== settings.concurrency || previous.autoConcurrency !== settings.autoConcurrency || serversChanged) {
         const cdn = settings.mode === "overseas" ? "海外 CDN"
           : settings.mode !== "custom" ? "大陆 CDN"
             : settings.customHosts.length ? `自定义的 ${settings.customHosts.length} 个服务器` : "大陆 CDN（自定义里还没选服务器）";
-        notices?.log("设置已经生效", `${settings.takeover === "compat" ? "兼容模式" : "全接管"}，使用${cdn}，开启 ${settings.concurrency} 条下载线程。`, "success", "", undefined, "settings");
+        const threads = settings.autoConcurrency ? `线程数自动调整（当前 ${autoThreads?.threads() || 8}，8 到 64）` : `开启 ${settings.concurrency} 条下载线程`;
+        notices?.log("设置已经生效", `${settings.takeover === "compat" ? "兼容模式" : "全接管"}，使用${cdn}，${threads}。`, "success", "", undefined, "settings");
       }
+      stats.autoThreads = settings.autoConcurrency ? autoThreads?.threads() || 0 : 0;
       stats.mode = settings.mode;
       syncSettingsMenu();
-      if (!settings.enabled) {
+      // 剧集加速 only matters on an episode page; elsewhere the video playing is left alone.
+      const episodeSwitched = previous.episodeEnabled !== settings.episodeEnabled && Boolean(routeIdentity()?.epId);
+      if (!settings.enabled || (episodeSwitched && settings.episodeEnabled === false)) {
         clearTakeoverFailure();
         stats.lastError = "";
         stopPlayer(true);
       }
-      else if (!previous.enabled || previous.takeover !== settings.takeover) {
+      else if (!previous.enabled || previous.takeover !== settings.takeover || episodeSwitched) {
         restartPlayer(true);
       }
       else {
@@ -5200,11 +6526,11 @@ const chrome = (() => {
         const { timeline = [], ...rest } = debug;
         // Node names and states only: no download address or account data.
         return JSON.stringify({
-          version: stats.version, at: Math.round(performance.now()), settings: { takeover: settings.takeover, mode: settings.mode, customHosts: settings.customHosts.slice(), concurrency: settings.concurrency, codec: nativeCodec() || "default" },
+          version: stats.version, scriptManager: document.documentElement?.getAttribute("data-btr-userscript-manager") || "", at: Math.round(performance.now()), settings: { takeover: settings.takeover, mode: settings.mode, customHosts: settings.customHosts.slice(), concurrency: settings.concurrency, codec: nativeCodec() || "default" },
           state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
         }, null, 1);
       },
-      version: "0.9.4.3"
+      version: "2026.10.8.1"
     })
   });
   publish();
@@ -5436,19 +6762,29 @@ const chrome = (() => {
 
   let settings = rangeCore.normalizeSettings({});
   let settingsLoaded = false;
-  const liveOn = () => settings.enabled && settings.liveEnabled !== false;
+  // Off until the saved settings have arrived: a viewer who switched the module off must
+  // not be taken over during the first second of the page.
+  const liveOn = () => settingsLoaded && settings.enabled && settings.liveEnabled !== false;
 
   // Bilibili's web player loads P2P SDKs that pull pieces from other viewers over WebRTC.
   // Overseas there are few viewers nearby, so P2P only adds stalls; the mocks keep the
   // player on the HTTP path. (Approach proven by Make-Bilibili-Great-Than-Ever-Before.)
+  // The page's own SDK is kept and handed out whenever the module is off.
   class MockPcdn { on() {} off() {} emit() {} destroy() {} }
   for (const name of ["PCDNLoader", "BPP2PSDK", "SeederSDK"]) {
-    try { Object.defineProperty(root, name, { value: MockPcdn, writable: false }); } catch (_error) {}
+    let real = root[name];
+    try {
+      Object.defineProperty(root, name, {
+        configurable: true,
+        get() { return liveOn() ? MockPcdn : real; },
+        set(value) { real = value; }
+      });
+    } catch (_error) {}
   }
 
-  // ---- stats for the extension badge and the settings panel ----
+  // ---- stats for the settings panel ----
   const stats = {
-    version: "0.9.4.3",
+    version: "2026.10.8.1",
     architecture: "live-segment-ripper",
     mode: "live",
     playerState: "waiting",
@@ -5492,8 +6828,18 @@ const chrome = (() => {
   // ---- one live stream: the playlist currently being played ----
   // context: { key, playlistUrl, pool, cache: Map(url -> {promise, at, hit}), lastNum, mapUrl, probing }
   let context = null;
+  // The stream the player asked for most recently. A playlist answer that arrives late,
+  // after the player moved on to another stream, must not bring the old one back.
+  let latestPlaylistKey = "";
 
   const swapHost = (url, host) => { const u = new URL(url); u.hostname = host; u.port = ""; return u.href; };
+  // Everything of a stream stops with it: queued prefetches, running downloads, probes.
+  function dropContext() {
+    if (!context) return;
+    context.prefetchQueue.length = 0;
+    context.abort.abort(new DOMException("直播已切换或加速已关闭", "AbortError"));
+    context = null;
+  }
   const directoryOf = (url) => { try { const u = new URL(url); return u.pathname.slice(0, u.pathname.lastIndexOf("/") + 1); } catch (_error) { return ""; } };
 
   function contextFor(playlistUrl) {
@@ -5502,14 +6848,18 @@ const chrome = (() => {
       context.playlistUrl = playlistUrl;
       return context;
     }
+    dropContext();
     const pool = core.createHostPool({
       onBan(host) { notices?.log("已停用一个直播节点", `${host} 两次没有返回数据，这个直播接下来不再使用它。`, "error", "", "live", "download"); }
     });
     let origin = "";
     try { origin = new URL(playlistUrl).hostname; } catch (_error) {}
-    if (origin) pool.add(origin, true);
-    for (const host of core.KNOWN_FMP4_HOSTS) if (host !== origin) pool.add(host, false);
-    context = { key, playlistUrl, pool, cache: new Map(), lastNum: 0, mapUrl: "", probing: false, speculativeMisses: 0, prefetchQueue: [], inflightPrefetch: 0, urgentInflight: 0 };
+    // The node Bilibili handed out is trusted unless it is a P2P relay. In the custom CDN
+    // mode only the servers the viewer picked join it; otherwise the known fMP4 group does.
+    if (origin && !core.isP2pUrl(playlistUrl)) pool.add(origin, true);
+    const extra = settings.mode === "custom" ? settings.customHosts : core.KNOWN_FMP4_HOSTS;
+    for (const host of extra) if (host !== origin) pool.add(host, false);
+    context = { key, playlistUrl, pool, cache: new Map(), lastNum: 0, mapUrl: "", probing: false, speculativeMisses: 0, prefetchQueue: [], inflightPrefetch: 0, urgentInflight: 0, abort: new AbortController() };
     stats.playerState = "ready";
     notices?.log("已接管这个直播", "直播分片改为多节点竞速下载，并提前缓存即将播放的分片。", "success", "", "live", "takeover");
     schedulePublish();
@@ -5526,13 +6876,24 @@ const chrome = (() => {
     Promise.allSettled(unproven.map(async (host) => {
       const startedAt = performance.now();
       try {
-        const response = await nativeFetch(swapHost(sampleUrl, host), {
-          headers: { Range: "bytes=0-2047" },
-          credentials: "omit",
-          cache: "no-store",
-          signal: AbortSignal.timeout(4000)
-        });
-        const body = new Uint8Array(await response.arrayBuffer());
+        const probe = new AbortController();
+        const probeTimer = setTimeout(() => probe.abort(new DOMException("直播节点探测超时", "TimeoutError")), 4000);
+        const dropProbe = () => probe.abort(ctx.abort.signal.reason);
+        ctx.abort.signal.addEventListener("abort", dropProbe, { once: true });
+        let response;
+        let body;
+        try {
+          response = await nativeFetch(swapHost(sampleUrl, host), {
+            headers: { Range: "bytes=0-2047" },
+            credentials: "omit",
+            cache: "no-store",
+            signal: probe.signal
+          });
+          body = new Uint8Array(await response.arrayBuffer());
+        } finally {
+          clearTimeout(probeTimer);
+          ctx.abort.signal.removeEventListener("abort", dropProbe);
+        }
         if ((response.status === 206 || response.status === 200) && body.byteLength > 0) {
           ctx.pool.success(host, performance.now() - startedAt, 0);
         } else {
@@ -5562,11 +6923,16 @@ const chrome = (() => {
       if (response.status !== 200 && response.status !== 206) {
         throw Object.assign(new Error(`直播分片响应异常：HTTP ${response.status}`), { status: response.status });
       }
+      // Nothing here asks for a range, so a 206 is only acceptable when it covers the file.
+      const contentRange = rangeCore.parseContentRange(response.headers.get("content-range"));
+      if (response.status === 206 && (!contentRange || contentRange.start !== 0 || contentRange.total === null || contentRange.end !== contentRange.total - 1)) {
+        throw new Error("直播分片只返回了一部分");
+      }
       const reader = response.body?.getReader?.();
       const chunks = [];
+      let firstByteMs = 0;
       if (reader) {
         const firstByteTimer = setTimeout(() => reader.cancel(new DOMException("直播分片首字节超时", "TimeoutError")).catch(() => {}), FIRST_BYTE_TIMEOUT_MS);
-        let firstByteMs = 0;
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -5582,16 +6948,19 @@ const chrome = (() => {
         clearTimeout(firstByteTimer);
       } else {
         const body = new Uint8Array(await response.arrayBuffer());
+        firstByteMs = performance.now() - startedAt;
         chunks.push(body);
         received = body.byteLength;
       }
       if (signal?.aborted) throw new DOMException("已取消", "AbortError");
       if (received <= 0) throw new Error("直播分片为空");
+      const declared = response.status === 206 ? contentRange.total : Number(response.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > 0 && received !== declared) throw new Error(`直播分片长度不对：收到 ${received}，应为 ${declared}`);
       const bytes = new Uint8Array(received);
       let offset = 0;
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
       const elapsed = Math.max(1, performance.now() - startedAt);
-      ctx.pool.success(host, elapsed, received * 1000 / elapsed);
+      ctx.pool.success(host, firstByteMs || elapsed, received * 1000 / elapsed);
       stats.lastHost = host;
       return { bytes, contentType: response.headers.get("content-type") || "video/iso.segment", host };
     } catch (error) {
@@ -5610,6 +6979,9 @@ const chrome = (() => {
     const hosts = ctx.pool.pick(2);
     if (!hosts.length) throw new Error("没有可用直播节点");
     const controllers = hosts.map(() => new AbortController());
+    const dropped = () => controllers.forEach((c) => { if (!c.signal.aborted) c.abort(ctx.abort.signal.reason); });
+    if (ctx.abort.signal.aborted) dropped();
+    else ctx.abort.signal.addEventListener("abort", dropped, { once: true });
     const overall = setTimeout(() => controllers.forEach((c) => c.abort(new DOMException("直播分片总超时", "TimeoutError"))), SEGMENT_TIMEOUT_MS);
     let primaryFailed = () => {};
     const primaryFailure = new Promise((resolve) => { primaryFailed = resolve; });
@@ -5636,6 +7008,7 @@ const chrome = (() => {
       throw aggregate?.errors?.at?.(-1) || aggregate;
     } finally {
       clearTimeout(overall);
+      ctx.abort.signal.removeEventListener("abort", dropped);
     }
   }
 
@@ -5691,11 +7064,13 @@ const chrome = (() => {
   // What a new playlist drives: prefetch the announced-but-uncached tail, the init map,
   // and — once everything announced is in hand — one speculative future segment, whose
   // 404 only means the encoder has not produced it yet.
-  function onPlaylist(playlistUrl, text) {
-    if (!liveOn()) return;
-    const ctx = contextFor(playlistUrl);
+  function onPlaylist(playlistUrl, text, requestedKey) {
+    if (!liveOn() || requestedKey !== latestPlaylistKey) return;
+    // Only fMP4 media playlists: a master playlist or a TS stream is not the module's business.
+    if (/#EXT-X-STREAM-INF/.test(text) || !/#EXT-X-MAP/.test(text)) return;
     const parsed = core.parseM3u8(text, playlistUrl);
-    if (!parsed.segments.length) return;
+    if (!parsed.segments.length || !parsed.segments.every((segment) => /\.m4s$/i.test(segment.name))) return;
+    const ctx = contextFor(playlistUrl);
     ctx.lastNum = Math.max(ctx.lastNum, parsed.lastNum);
     if (parsed.mapUrl) {
       ctx.mapUrl = parsed.mapUrl;
@@ -5728,37 +7103,55 @@ const chrome = (() => {
     schedulePublish();
   }
 
-  async function serveSegment(url) {
+  async function serveSegment(url, input, init) {
     const ctx = context;
+    const signal = init?.signal || (input instanceof Request ? input.signal : null);
+    if (signal?.aborted) throw signal.reason || new DOMException("已取消", "AbortError");
     const cached = ctx?.cache.get(url);
     const item = cached || (ctx && directoryOf(url) === ctx.key ? cacheSegment(ctx, url, { urgent: true }) : null);
-    if (!item) return nativeFetch(url, { credentials: "omit", cache: "no-store" });
+    if (!item) return nativeFetch(input, init);
     // While the player waits here, the prefetch queue slows to a trickle so the waited-for
     // segment gets the bandwidth.
     if (!cached && ctx) ctx.urgentInflight += 1;
+    let stopWaiting = () => {};
     try {
-      const result = await item.promise;
+      // The download goes on for the cache; only this caller stops waiting.
+      const result = await (signal ? Promise.race([item.promise, new Promise((_resolve, reject) => {
+        stopWaiting = () => reject(signal.reason || new DOMException("已取消", "AbortError"));
+        signal.addEventListener("abort", stopWaiting, { once: true });
+      })]) : item.promise);
       if (!item.hit) {
         item.hit = true;
         stats.acceleratedRequests += 1;
         stats.acceleratedBytes += result.bytes.byteLength;
         schedulePublish();
       }
-      return new Response(result.bytes.slice(), {
+      const response = new Response(result.bytes.slice(), {
         status: 200,
         headers: { "Content-Type": result.contentType, "Content-Length": String(result.bytes.byteLength) }
       });
+      try { Object.defineProperty(response, "url", { value: url }); } catch (_error) {}
+      return response;
     } catch (error) {
+      if (error?.name === "AbortError") throw error;
       stats.lastError = String(error?.message || error).slice(0, 160);
       notices?.log("直播分片下载失败", `${stats.lastError}\n这一片交回给 B 站原来的连接。`, "error", "seg-fallback", "live", "download");
       schedulePublish();
-      return nativeFetch(url, { credentials: "omit", cache: "no-store" });
+      return nativeFetch(input, init);
     } finally {
+      signal?.removeEventListener("abort", stopWaiting);
       if (!cached && ctx) {
         ctx.urgentInflight = Math.max(0, ctx.urgentInflight - 1);
         pumpPrefetch(ctx);
       }
     }
+  }
+
+  // A request whose URL was rewritten keeps everything else the player gave it: headers,
+  // credentials, signal, cache mode.
+  function withUrl(input, url) {
+    if (!(input instanceof Request)) return url;
+    try { return new Request(url, input); } catch (_error) { return url; }
   }
 
   // P2P and relay-wrapped URLs route back to the best official node; without a pool yet,
@@ -5781,16 +7174,20 @@ const chrome = (() => {
     if (method !== "GET") return nativeFetch(input, init);
     const rewritten = rewriteUrl(url);
     if (core.isLivePlaylistUrl(rewritten)) {
-      const pending = nativeFetch(rewritten === url ? input : rewritten, init);
+      const requestedKey = directoryOf(rewritten);
+      latestPlaylistKey = requestedKey;
+      const pending = nativeFetch(rewritten === url ? input : withUrl(input, rewritten), init);
       pending.then((response) => {
-        response.clone().text().then((text) => onPlaylist(response.url || rewritten, text)).catch(() => {});
+        response.clone().text().then((text) => onPlaylist(response.url || rewritten, text, requestedKey)).catch(() => {});
       }).catch(() => {});
       return pending;
     }
-    if (core.isLiveSegmentUrl(rewritten) && !(init?.headers && new Headers(init.headers).get("range"))) {
-      return serveSegment(rewritten);
+    let ranged = false;
+    try { ranged = Boolean((init?.headers && new Headers(init.headers).get("range")) || (input instanceof Request && input.headers.get("range"))); } catch (_error) {}
+    if (core.isLiveSegmentUrl(rewritten) && !ranged) {
+      return serveSegment(rewritten, rewritten === url ? input : withUrl(input, rewritten), init);
     }
-    if (rewritten !== url) return nativeFetch(rewritten, init);
+    if (rewritten !== url) return nativeFetch(withUrl(input, rewritten), init);
     return nativeFetch(input, init);
   };
 
@@ -5830,8 +7227,11 @@ const chrome = (() => {
         notices?.log("直播加速设置已生效", liveOn() ? "直播分片使用多节点竞速下载。" : "直播加速已关闭，使用 B 站原来的连接。", "success", "", "live", "settings");
       }
       if (!liveOn()) {
-        context = null;
+        dropContext();
         stats.playerState = "disabled";
+      } else if (previous.mode !== settings.mode || previous.customHosts.join() !== settings.customHosts.join()) {
+        // A new CDN choice means a new node pool; the next playlist builds it.
+        dropContext();
       }
       publish();
     } else if (event.data.type === "get-stats") {
@@ -5848,7 +7248,7 @@ const chrome = (() => {
         hosts: context.pool.status()
       },
       getStats: () => ({ ...stats }),
-      version: "0.9.4.3"
+      version: "2026.10.8.1"
     })
   });
   publish();
@@ -5959,7 +7359,7 @@ const chrome = (() => {
       const style = document.createElement("style");
       style.textContent = `
         :host{color-scheme:dark}
-        .stack{position:absolute;inset:0;overflow:hidden}
+        .stack{position:absolute;inset:0;overflow:hidden;user-select:none;-webkit-user-select:none}
         .layer{position:absolute;inset:0}
         .errors{z-index:1}
         .entry{position:absolute;top:0;left:2px;right:2px;min-width:0}
@@ -6165,228 +7565,19 @@ const chrome = (() => {
   "use strict";
 
   const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
-  const VERSION = "0.9.4.3";
+  const VERSION = "2026.10.8.1";
   const notices = globalThis.__BTR_NOTIFICATION_VIEW__;
   const ERROR_NOTICE_ID = "__bilibili_thread_ripper_error_notice__";
   const ERROR_NOTICE_STYLE_ID = "__bilibili_thread_ripper_error_notice_style__";
-  const ONBOARDING_ID = "__bilibili_thread_ripper_onboarding__";
-  const ONBOARDING_STYLE_ID = "__bilibili_thread_ripper_onboarding_style__";
-  const ONBOARDING_STORAGE_KEY = "btrOnboardingRevision";
-  const ONBOARDING_REVISION = "native-progressive-mse-v1";
   const THREAD_OPTIONS = Object.freeze([4, 8, 16, 32, 64, 128]);
-  const DEFAULTS = { enabled: true, liveEnabled: true, concurrency: 8, takeover: "full", mode: "mainland", customHosts: [], debugNotices: false, errorNotices: false, debugCategories: {} };
-  // Settings of the old ArtPlayer version and of the removed compatibility modes.
-  const RETIRED_KEYS = ["statusNotice", "compatibilityMode", "volume", "danmaku", "danmakuFontSize", "subtitleLanguage", "subtitleLastLanguage"];
+  const DEFAULTS = { enabled: true, liveEnabled: false, episodeEnabled: true, theme: "auto", concurrency: 8, autoConcurrency: true, takeover: "full", mode: "mainland", customHosts: [], floatingButton: true, floatingButtonLeft: null, floatingButtonTop: null, debugNotices: false, errorNotices: false, debugCategories: {} };
+  // Settings of the old ArtPlayer version, of the removed compatibility modes, and the flag
+  // of the first-run guide that 0.9.4.2 removed.
+  const RETIRED_KEYS = ["statusNotice", "compatibilityMode", "volume", "danmaku", "danmakuFontSize", "subtitleLanguage", "subtitleLastLanguage", "btrOnboardingRevision"];
   let latestSettings = { ...DEFAULTS };
   let latestStats = null;
   let loaded = false;
-  let lastBadge = null;
-  let onboardingChecked = false;
   let errorNoticeMotion = null;
-
-  function removeOnboarding() {
-    document.getElementById(ONBOARDING_ID)?.remove();
-    document.getElementById(ONBOARDING_STYLE_ID)?.remove();
-  }
-
-  function mountOnboarding() {
-    if (document.getElementById(ONBOARDING_ID)) return;
-    const mount = document.body || document.documentElement;
-    if (!mount) {
-      document.addEventListener("DOMContentLoaded", mountOnboarding, { once: true });
-      return;
-    }
-
-    const style = document.createElement("style");
-    style.id = ONBOARDING_STYLE_ID;
-    style.textContent = `
-      #${ONBOARDING_ID}{position:fixed!important;inset:0!important;z-index:2147483646!important;display:flex!important;align-items:center!important;justify-content:center!important;padding:16px!important;box-sizing:border-box!important;background:rgba(0,0,0,.62)!important;font-family:"Microsoft YaHei","PingFang SC",Arial,sans-serif!important;color:#18191c!important}
-      #${ONBOARDING_ID} *{box-sizing:border-box!important}
-      #${ONBOARDING_ID} .btr-onboarding-panel{width:min(440px,calc(100vw - 32px))!important;max-height:calc(100vh - 32px)!important;overflow:auto!important;padding:28px!important;border:1px solid #e3e5e7!important;border-radius:12px!important;background:#fff!important;box-shadow:none!important}
-      #${ONBOARDING_ID} .btr-onboarding-heading{display:flex!important;align-items:center!important;justify-content:space-between!important;gap:16px!important;margin:0 0 6px!important}
-      #${ONBOARDING_ID} h2{margin:0!important;font-size:22px!important;line-height:1.35!important;font-weight:700!important;color:#18191c!important}
-      #${ONBOARDING_ID} .btr-onboarding-version{flex:none!important;padding:3px 8px!important;border-radius:5px!important;background:#f1f2f3!important;color:#61666d!important;font-size:12px!important;line-height:18px!important}
-      #${ONBOARDING_ID} .btr-onboarding-lead{margin:0 0 24px!important;color:#61666d!important;font-size:13px!important;line-height:1.7!important}
-      #${ONBOARDING_ID} fieldset{min-width:0!important;margin:0 0 22px!important;padding:0!important;border:0!important}
-      #${ONBOARDING_ID} legend{display:block!important;width:100%!important;margin:0 0 10px!important;padding:0!important;color:#18191c!important;font-size:14px!important;line-height:20px!important;font-weight:600!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode-list{display:grid!important;grid-template-columns:1fr 1fr!important;gap:10px!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode{position:relative!important;display:block!important;cursor:pointer!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode input{position:absolute!important;width:1px!important;height:1px!important;opacity:0!important;pointer-events:none!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode-body{display:block!important;min-height:78px!important;padding:13px!important;border:1px solid #dcdfe3!important;border-radius:8px!important;background:#fff!important;color:#18191c!important;transition:border-color .15s ease,background-color .15s ease!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode input:checked+.btr-onboarding-mode-body{border-color:#fb7299!important;background:#fff1f5!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode input:focus-visible+.btr-onboarding-mode-body{outline:2px solid #00aeec!important;outline-offset:2px!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode-name{display:block!important;margin:0 0 5px!important;font-size:14px!important;line-height:20px!important;font-weight:600!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode-note{display:block!important;color:#9499a0!important;font-size:12px!important;line-height:18px!important;font-weight:400!important}
-      #${ONBOARDING_ID} .btr-onboarding-hint{margin:8px 0 0!important;color:#9499a0!important;font-size:12px!important;line-height:18px!important}
-      #${ONBOARDING_ID} .btr-onboarding-thread-head{display:flex!important;align-items:center!important;justify-content:space-between!important;margin:0 0 6px!important}
-      #${ONBOARDING_ID} .btr-onboarding-thread-value{color:#fb7299!important;font-size:22px!important;line-height:28px!important;font-weight:700!important;font-variant-numeric:tabular-nums!important}
-      #${ONBOARDING_ID} input[type="range"]{display:block!important;width:100%!important;height:24px!important;margin:0!important;accent-color:#fb7299!important;cursor:pointer!important}
-      #${ONBOARDING_ID} .btr-onboarding-ticks{display:flex!important;justify-content:space-between!important;margin-top:2px!important;color:#9499a0!important;font-size:11px!important;line-height:16px!important}
-      #${ONBOARDING_ID} .btr-onboarding-tip{margin:0 0 18px!important;padding:10px 12px!important;border-radius:7px!important;background:#f6f7f8!important;color:#61666d!important;font-size:12px!important;line-height:18px!important}
-      #${ONBOARDING_ID} .btr-onboarding-save{display:block!important;width:100%!important;height:42px!important;margin:0!important;border:0!important;border-radius:8px!important;background:#fb7299!important;color:#fff!important;font:600 14px/42px "Microsoft YaHei","PingFang SC",Arial,sans-serif!important;text-align:center!important;cursor:pointer!important}
-      #${ONBOARDING_ID} .btr-onboarding-save:hover{background:#fc8bab!important}
-      #${ONBOARDING_ID} .btr-onboarding-save:focus-visible{outline:2px solid #00aeec!important;outline-offset:2px!important}
-      #${ONBOARDING_ID} .btr-onboarding-save:disabled{background:#c9ccd0!important;cursor:default!important}
-      #${ONBOARDING_ID} .btr-onboarding-status{min-height:18px!important;margin:8px 0 0!important;color:#f85a54!important;font-size:12px!important;line-height:18px!important;text-align:center!important}
-      @media(max-width:520px){#${ONBOARDING_ID} .btr-onboarding-panel{padding:22px!important}#${ONBOARDING_ID} .btr-onboarding-mode-list{grid-template-columns:1fr!important}#${ONBOARDING_ID} .btr-onboarding-mode-body{min-height:0!important}}
-    `;
-    (document.head || document.documentElement).append(style);
-
-    const overlay = document.createElement("div");
-    overlay.id = ONBOARDING_ID;
-    overlay.dataset.version = VERSION;
-    overlay.setAttribute("role", "dialog");
-    overlay.setAttribute("aria-modal", "true");
-    overlay.setAttribute("aria-labelledby", "btr-onboarding-title");
-
-    const panel = document.createElement("section");
-    panel.className = "btr-onboarding-panel";
-    const heading = document.createElement("div");
-    heading.className = "btr-onboarding-heading";
-    const title = document.createElement("h2");
-    title.id = "btr-onboarding-title";
-    title.textContent = "Bilibili 线程撕裂者";
-    const version = document.createElement("span");
-    version.className = "btr-onboarding-version";
-    version.textContent = `v${VERSION}`;
-    heading.append(title, version);
-
-    const lead = document.createElement("p");
-    lead.className = "btr-onboarding-lead";
-    lead.textContent = "首次使用请完成加速设置。播放器、弹幕和字幕仍由 B 站原生功能负责，线程撕裂者只优化视频传输。";
-
-    // Two cards to pick from, as for the CDN mode and the takeover mode.
-    const cardList = (inputName, options, selected) => {
-      const list = document.createElement("div");
-      list.className = "btr-onboarding-mode-list";
-      for (const option of options) {
-        const label = document.createElement("label");
-        label.className = "btr-onboarding-mode";
-        const input = document.createElement("input");
-        input.type = "radio";
-        input.name = inputName;
-        input.value = option.value;
-        input.checked = option.value === selected;
-        const body = document.createElement("span");
-        body.className = "btr-onboarding-mode-body";
-        const name = document.createElement("span");
-        name.className = "btr-onboarding-mode-name";
-        name.textContent = option.name;
-        const note = document.createElement("span");
-        note.className = "btr-onboarding-mode-note";
-        note.textContent = option.note;
-        body.append(name, note);
-        label.append(input, body);
-        list.append(label);
-      }
-      return list;
-    };
-
-    const modeFieldset = document.createElement("fieldset");
-    const modeLegend = document.createElement("legend");
-    modeLegend.textContent = "CDN 模式";
-    modeFieldset.append(modeLegend, cardList("btr-onboarding-mode", [
-      { value: "mainland", name: "大陆 CDN（推荐）", note: "优先使用大陆 bilivideo 节点" },
-      { value: "overseas", name: "海外 CDN", note: "优先使用海外及镜像节点" }
-    ], latestSettings.mode));
-
-    const takeoverFieldset = document.createElement("fieldset");
-    const takeoverLegend = document.createElement("legend");
-    takeoverLegend.textContent = "接管方式";
-    const takeoverHint = document.createElement("p");
-    takeoverHint.className = "btr-onboarding-hint";
-    takeoverHint.textContent = "Safari 用户建议使用兼容模式。以后可以在设置面板里随时改。";
-    takeoverFieldset.append(takeoverLegend, cardList("btr-onboarding-takeover", [
-      { value: "full", name: "全接管（推荐）", note: "视频由插件自己来放，什么时候下、下多少都由插件安排，效果最好" },
-      { value: "compat", name: "兼容模式", note: "还是 B 站自己的播放器在放，插件只帮它多线程下载，换清晰度交给 B 站，更不容易出问题" }
-    ], latestSettings.takeover), takeoverHint);
-
-    const threadFieldset = document.createElement("fieldset");
-    const threadHead = document.createElement("div");
-    threadHead.className = "btr-onboarding-thread-head";
-    const threadLegend = document.createElement("legend");
-    threadLegend.textContent = "并发线程";
-    const threadValue = document.createElement("output");
-    threadValue.className = "btr-onboarding-thread-value";
-    const initialThreadIndex = Math.max(0, THREAD_OPTIONS.indexOf(latestSettings.concurrency));
-    threadValue.value = String(THREAD_OPTIONS[initialThreadIndex]);
-    threadValue.textContent = String(THREAD_OPTIONS[initialThreadIndex]);
-    threadHead.append(threadLegend, threadValue);
-    const threadRange = document.createElement("input");
-    threadRange.type = "range";
-    threadRange.min = "0";
-    threadRange.max = String(THREAD_OPTIONS.length - 1);
-    threadRange.step = "1";
-    threadRange.value = String(initialThreadIndex);
-    threadRange.setAttribute("aria-label", "并发线程");
-    threadRange.addEventListener("input", () => {
-      const value = THREAD_OPTIONS[Number(threadRange.value)] || 8;
-      threadValue.value = String(value);
-      threadValue.textContent = String(value);
-    });
-    const ticks = document.createElement("div");
-    ticks.className = "btr-onboarding-ticks";
-    for (const value of THREAD_OPTIONS) {
-      const tick = document.createElement("span");
-      tick.textContent = String(value);
-      ticks.append(tick);
-    }
-    threadFieldset.append(threadHead, threadRange, ticks);
-
-    const tip = document.createElement("p");
-    tip.className = "btr-onboarding-tip";
-    tip.textContent = "推荐大陆 CDN，线程数推荐 8 到 32，可以先从 8 开始，不够流畅再往上加。以后可在 B 站播放器的 ⚙ 设置中随时修改。";
-    const save = document.createElement("button");
-    save.type = "button";
-    save.className = "btr-onboarding-save";
-    save.textContent = "保存并开始加速";
-    const status = document.createElement("p");
-    status.className = "btr-onboarding-status";
-    status.setAttribute("aria-live", "polite");
-    save.addEventListener("click", () => {
-      const mode = panel.querySelector('input[name="btr-onboarding-mode"]:checked')?.value === "overseas" ? "overseas" : "mainland";
-      const takeover = panel.querySelector('input[name="btr-onboarding-takeover"]:checked')?.value === "compat" ? "compat" : "full";
-      const concurrency = THREAD_OPTIONS[Number(threadRange.value)] || 8;
-      save.disabled = true;
-      save.textContent = "正在保存…";
-      latestSettings = normalizeStoredSettings({ ...latestSettings, enabled: true, mode, takeover, concurrency });
-      chrome.storage.sync.set({ enabled: true, mode, takeover, concurrency }, () => {
-        if (chrome.runtime.lastError) {
-          status.textContent = `保存失败：${chrome.runtime.lastError.message}`;
-          save.disabled = false;
-          save.textContent = "重新保存";
-          return;
-        }
-        chrome.storage.local.set({ [ONBOARDING_STORAGE_KEY]: ONBOARDING_REVISION }, () => {
-          if (chrome.runtime.lastError) {
-            status.textContent = `保存失败：${chrome.runtime.lastError.message}`;
-            save.disabled = false;
-            save.textContent = "重新保存";
-            return;
-          }
-          loaded = true;
-          postSettings();
-          notices?.configure(latestSettings);
-          updateBadge();
-          removeOnboarding();
-        });
-      });
-    });
-
-    panel.append(heading, lead, modeFieldset, takeoverFieldset, threadFieldset, tip, save, status);
-    overlay.append(panel);
-    mount.append(overlay);
-    save.focus({ preventScroll: true });
-  }
-
-  function showOnboardingIfNeeded() {
-    if (onboardingChecked || window.top !== window) return;
-    onboardingChecked = true;
-    chrome.storage.local.get({ [ONBOARDING_STORAGE_KEY]: "" }, (stored) => {
-      if (stored?.[ONBOARDING_STORAGE_KEY] === ONBOARDING_REVISION) return;
-      setTimeout(mountOnboarding, 350);
-    });
-  }
 
   // The page checks each custom server again with the full rules before using it; here it
   // only has to look like a host name.
@@ -6394,13 +7585,20 @@ const chrome = (() => {
     const threads = Math.trunc(Number(input?.concurrency));
     return {
       enabled: input?.enabled !== false,
+      liveEnabled: input?.liveEnabled === true,
+      episodeEnabled: input?.episodeEnabled !== false,
+      theme: ["light", "dark"].includes(input?.theme) ? input.theme : "auto",
       concurrency: THREAD_OPTIONS.includes(threads) ? threads : 8,
+      autoConcurrency: input?.autoConcurrency !== false,
       takeover: input?.takeover === "compat" ? "compat" : "full",
       mode: ["overseas", "custom"].includes(input?.mode) ? input.mode : "mainland",
       customHosts: (Array.isArray(input?.customHosts) ? input.customHosts : [])
         .map((host) => String(host).trim().toLowerCase())
         .filter((host, index, all) => /^[a-z\d](?:[a-z\d.-]{0,251}[a-z\d])?$/.test(host) && all.indexOf(host) === index)
         .slice(0, 32),
+      floatingButton: input?.floatingButton !== false,
+      floatingButtonLeft: input?.floatingButtonLeft != null && Number(input.floatingButtonLeft) >= 0 && Number(input.floatingButtonLeft) <= 1 ? Number(input.floatingButtonLeft) : null,
+      floatingButtonTop: input?.floatingButtonTop != null && Number(input.floatingButtonTop) >= 0 && Number(input.floatingButtonTop) <= 1 ? Number(input.floatingButtonTop) : null,
       debugNotices: input?.debugNotices === true,
       errorNotices: input?.errorNotices === true,
       debugCategories: Object.fromEntries(["takeover", "playback", "download", "buffer", "settings", "other"].map(key => [key, input?.debugCategories?.[key] !== false]))
@@ -6409,16 +7607,6 @@ const chrome = (() => {
 
   function postSettings() {
     window.postMessage({ channel: CHANNEL, type: "settings", payload: latestSettings }, "*");
-  }
-
-  function updateBadge() {
-    const count = Math.max(0, Math.min(512, Math.trunc(Number(latestStats?.activeThreads) || 0)));
-    const text = loaded && latestSettings.enabled !== false ? String(count) : "";
-    if (text === lastBadge) return;
-    lastBadge = text;
-    try {
-      chrome.runtime.sendMessage({ type: "setThreadBadge", enabled: latestSettings.enabled !== false, activeThreads: count })?.catch?.(() => {});
-    } catch (_error) {}
   }
 
   function normalizeTakeoverError(input) {
@@ -6481,7 +7669,7 @@ const chrome = (() => {
       const style = document.createElement("style");
       style.id = ERROR_NOTICE_STYLE_ID;
       style.textContent = `
-        #${ERROR_NOTICE_ID}{position:fixed!important;left:14px!important;bottom:14px!important;z-index:2147483646!important;width:min(280px,calc(100vw - 28px))!important;max-height:65vh!important;overflow:auto!important;box-sizing:border-box!important;border:1px solid #a44949!important;border-radius:5px!important;background:rgba(8,8,10,.78)!important;color:#f2f2ee!important;font-family:Tahoma,"Microsoft YaHei",sans-serif!important;text-shadow:1px 1px 0 #0009!important;box-shadow:inset 0 1px 0 #ffffff12,1px 1px 2px #0007!important}
+        #${ERROR_NOTICE_ID}{position:fixed!important;left:14px!important;bottom:14px!important;z-index:2147483646!important;width:min(280px,calc(100vw - 28px))!important;max-height:65vh!important;overflow:auto!important;box-sizing:border-box!important;border:1px solid #a44949!important;border-radius:5px!important;background:rgba(8,8,10,.78)!important;color:#f2f2ee!important;font-family:Tahoma,"Microsoft YaHei",sans-serif!important;text-shadow:1px 1px 0 #0009!important;box-shadow:inset 0 1px 0 #ffffff12,1px 1px 2px #0007!important;user-select:none!important;-webkit-user-select:none!important}
         #${ERROR_NOTICE_ID} *{box-sizing:border-box!important}
         #${ERROR_NOTICE_ID} .btr-error-summary{padding:7px 9px!important}
         #${ERROR_NOTICE_ID} .btr-error-title{margin:0!important;color:#f28b85!important;font-size:13px!important;font-weight:700!important;line-height:18px!important}
@@ -6491,7 +7679,7 @@ const chrome = (() => {
         #${ERROR_NOTICE_ID} .btr-error-toggle:focus-visible,#${ERROR_NOTICE_ID} .btr-error-retry:focus-visible{outline:2px solid #00aeec!important;outline-offset:2px!important}
         #${ERROR_NOTICE_ID} .btr-error-details{display:none!important;padding:0 15px 14px!important;border-top:1px solid #2f3136!important}
         #${ERROR_NOTICE_ID}[data-expanded="true"] .btr-error-details{display:block!important}
-        #${ERROR_NOTICE_ID} .btr-error-log{margin:11px 0 12px!important;padding:10px!important;border:0!important;border-radius:4px!important;background:#222328!important;color:#c9ccd0!important;font:12px/1.6 Consolas,"Microsoft YaHei",monospace!important;white-space:pre-wrap!important;overflow-wrap:anywhere!important;user-select:text!important}
+        #${ERROR_NOTICE_ID} .btr-error-log{margin:11px 0 12px!important;padding:10px!important;border:0!important;border-radius:4px!important;background:#222328!important;color:#c9ccd0!important;font:12px/1.6 Consolas,"Microsoft YaHei",monospace!important;white-space:pre-wrap!important;overflow-wrap:anywhere!important;user-select:text!important;-webkit-user-select:text!important}
         #${ERROR_NOTICE_ID} .btr-error-retry{height:30px!important;margin:0!important;padding:0 13px!important;border:1px solid #a44949!important;border-radius:3px!important;background:#713b3b!important;color:#fff!important;font:700 12px/28px Tahoma,"Microsoft YaHei",sans-serif!important;cursor:pointer!important}
         #${ERROR_NOTICE_ID} .btr-error-retry:hover{background:#8a4545!important}
         #${ERROR_NOTICE_ID} .btr-error-retry:disabled{background:#6b4b55!important;color:#d8c5cb!important;cursor:default!important}
@@ -6582,9 +7770,7 @@ const chrome = (() => {
     loaded = true;
     notices?.configure(latestSettings);
     syncTakeoverErrorNotice();
-    updateBadge();
     postSettings();
-    showOnboardingIfNeeded();
   });
 
   chrome.storage.onChanged.addListener((changes, areaName) => {
@@ -6596,7 +7782,6 @@ const chrome = (() => {
     loaded = true;
     notices?.configure(latestSettings);
     syncTakeoverErrorNotice();
-    updateBadge();
     postSettings();
   });
 
@@ -6660,14 +7845,7 @@ const chrome = (() => {
         host: String(item?.host || "").slice(0, 120)
       })) : []
     };
-    updateBadge();
     syncTakeoverErrorNotice();
-  });
-
-  // The toolbar icon of the extension. The settings panel runs in the page.
-  chrome.runtime.onMessage.addListener((message) => {
-    if (message?.type === "openSettings" && window.top === window) window.postMessage({ channel: CHANNEL, type: "open-settings", payload: { toggle: true } }, "*");
-    return false;
   });
 })();
 }
@@ -6676,8 +7854,67 @@ const chrome = (() => {
 // Runs wherever the userscript manager puts the script. The accelerator itself has to run in
 // the bilibili page, so pageCode is started there. The manager's menu only sends a page
 // event that opens the settings panel.
+//
+// pageCode is called directly only when this script already runs as a page script (window
+// is the page's own). Otherwise it is injected as a script element: with any @grant,
+// Tampermonkey and Violentmonkey both wrap window in a sandbox that keeps globals to the
+// script, and in Violentmonkey's "content" mode (the one the header asks for) even
+// unsafeWindow is the content script's global rather than the page's.
 const LOADED = "data-btr-userscript";
 const pageWindow = typeof unsafeWindow !== "undefined" && unsafeWindow ? unsafeWindow : window;
+
+// Which manager runs the script, its version and injection mode, for the diagnostic report
+// (Tampermonkey and Violentmonkey both describe themselves in GM_info).
+const MANAGER_MARK = "data-btr-userscript-manager";
+function describeManager() {
+  try {
+    const info = typeof GM_info === "object" && GM_info ? GM_info : null;
+    return info ? [info.scriptHandler, info.version, info.injectInto].filter(Boolean).map(String).join(" ").slice(0, 80) : "";
+  } catch (_error) { return ""; }
+}
+
+// The settings live in the manager's storage, which every bilibili subdomain shares; this
+// site's localStorage is separate on each one, so a setting changed on space.bilibili.com
+// never reached the video pages. Only this side of the script can use the manager's storage:
+// the page code (storage-shim.js) asks for it with events carrying JSON text. An empty
+// manager starts with defaults; localStorage is only a fallback, never a migration source.
+const STORAGE_MARK = "data-btr-userscript-storage";
+const manager = typeof GM !== "undefined" && typeof GM?.getValue === "function" && typeof GM?.setValue === "function" ? GM : null;
+const managerReportsChanges = typeof GM_addValueChangeListener === "function";
+
+function answerPage(type, message) {
+  document.dispatchEvent(new CustomEvent(type, { detail: JSON.stringify(message) }));
+}
+
+function serveStorage() {
+  const read = async (area) => {
+    const stored = await manager.getValue(area);
+    return typeof stored === "string" ? stored : "{}";
+  };
+  // One request at a time: a change reads what is stored and writes it back.
+  let queue = Promise.resolve();
+  document.addEventListener("btr-userscript-storage-request", (event) => {
+    let request = null;
+    try { request = JSON.parse(event.detail); } catch (_error) { return; }
+    if (!request || !["sync", "local"].includes(request.area)) return;
+    queue = queue.then(async () => {
+      let value = {};
+      try { value = JSON.parse(await read(request.area)) || {}; } catch (_error) {}
+      if (request.op === "set") Object.assign(value, request.items);
+      else if (request.op === "remove") for (const key of [].concat(request.keys)) delete value[key];
+      if (request.op === "set" || request.op === "remove") await manager.setValue(request.area, JSON.stringify(value));
+      answerPage("btr-userscript-storage-reply", { id: request.id, value });
+    }).catch((error) => answerPage("btr-userscript-storage-reply", { id: request.id, error: String(error?.message || error) }));
+  });
+  if (managerReportsChanges) {
+    for (const area of ["sync", "local"]) {
+      GM_addValueChangeListener(area, (_name, _oldValue, value, remote) => {
+        if (remote) answerPage("btr-userscript-storage-change", { area, value: typeof value === "string" ? value : "{}" });
+      });
+    }
+  }
+}
+if (manager) serveStorage();
 
 function injected() {
   return document.documentElement?.hasAttribute(LOADED) === true;
@@ -6698,13 +7935,22 @@ function inject() {
   if (!injected()) console.error("BTR: 无法在页面里启动线程撕裂者");
 }
 
-if (pageWindow === window) pageCode();
-else if (document.documentElement) inject();
+// The page code reads this mark once, when it starts, to know whether its settings go
+// through the manager ("live": the manager also reports other tabs' changes).
+function start() {
+  if (manager) document.documentElement.setAttribute(STORAGE_MARK, managerReportsChanges ? "manager live" : "manager");
+  const described = describeManager();
+  if (described) document.documentElement.setAttribute(MANAGER_MARK, described);
+  if (pageWindow === window) pageCode();
+  else inject();
+}
+
+if (document.documentElement) start();
 else {
   const observer = new MutationObserver(() => {
     if (!document.documentElement) return;
     observer.disconnect();
-    inject();
+    start();
   });
   observer.observe(document, { childList: true });
 }
